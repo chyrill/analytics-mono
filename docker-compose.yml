@@ -1,0 +1,72 @@
+# ── analytics-mono — docker-compose (local development) ──────────────────────
+# Provides: Postgres (real), LocalStack (S3 + Lambda smoke testing), Adminer
+#
+# Usage:
+#   docker compose up -d          → start all services
+#   docker compose down -v        → stop + wipe volumes
+#   docker compose logs -f        → tail all logs
+#
+# Note: Postgres runs on 5433 (not 5432) to avoid colliding with a local install.
+
+version: "3.9"
+
+services:
+
+  # ── Postgres (real instance — LocalStack does not reliably emulate RDS) ─────
+  postgres:
+    image: postgres:16-alpine
+    container_name: analytics_pg
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: analytics
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: analytics
+    volumes:
+      - analytics_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analytics -d analytics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── LocalStack (S3 + Lambda smoke testing only) ───────────────────────────
+  # Community edition — enough for S3 pipeline validation and basic Lambda smoke tests.
+  # API routes are tested via the Lambda dev HTTP wrapper (pnpm dev in apps/api).
+  # EventBridge Scheduler is Pro-only — run sync handlers directly with pnpm run:zoho etc.
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: analytics_localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,lambda,iam,logs,sqs
+      DEBUG: "0"
+      LAMBDA_EXECUTOR: local       # avoid Docker-in-Docker issues on Community
+      AWS_DEFAULT_REGION: ap-southeast-2
+      PERSISTENCE: 1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # ── Adminer (lightweight DB UI) ───────────────────────────────────────────
+  adminer:
+    image: adminer:4
+    container_name: analytics_adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  analytics_pg_data:
+  localstack_data:

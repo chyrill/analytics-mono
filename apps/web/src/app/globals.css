@@ -1,0 +1,2 @@
+*, *::before, *::after { box-sizing: border-box; }
+@keyframes spin { to { transform: rotate(360deg); } }
