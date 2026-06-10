@@ -10,6 +10,11 @@ import * as ordersDispatchedSchema from "./schema/orders-dispatched";
 import * as saleorOrdersSchema from "./schema/saleor-orders";
 
 import * as zohoDealsSchema from "./schema/zoho-deals";
+import * as zohoEventsSchema from "./schema/zoho-events";
+import * as syncJobsSchema from "./schema/sync-jobs";
+import * as syncCheckpointsSchema from "./schema/sync-checkpoints";
+import * as dbPatientsSchema from "./schema/db-patients";
+import * as dbTreatmentPlansSchema from "./schema/db-treatment-plans";
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
@@ -32,6 +37,11 @@ const schema = {
   ...ordersDispatchedSchema,
   ...saleorOrdersSchema,
   ...zohoDealsSchema,
+  ...zohoEventsSchema,
+  ...syncJobsSchema,
+  ...syncCheckpointsSchema,
+  ...dbPatientsSchema,
+  ...dbTreatmentPlansSchema,
 };
 
 export const db = drizzle(client, { schema });
@@ -45,3 +55,8 @@ export * from "./schema/orders-dispatched";
 export * from "./schema/saleor-orders";
 export * from "./schema/reconciliation-log";
 export * from "./schema/zoho-deals";
+export * from "./schema/zoho-events";
+export * from "./schema/sync-jobs";
+export * from "./schema/sync-checkpoints";
+export * from "./schema/db-patients";
+export * from "./schema/db-treatment-plans";
