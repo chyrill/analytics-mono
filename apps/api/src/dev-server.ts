@@ -293,21 +293,31 @@ function buildHealthQuery(from?: string, to?: string) {
 
   return sql.raw(`
   WITH
-  -- Latest treatment plan per email — allotted grams is the sum of all THC-variant quantities.
-  treatment_plan_totals AS (
-    SELECT DISTINCT ON (email)
+  -- Latest supply snapshot per distinct fill window (interval_key) for each patient.
+  supply_by_interval AS (
+    SELECT DISTINCT ON (email, interval_key)
       email,
-      COALESCE(total_quantity_22::numeric, 0)
-        + COALESCE(total_quantity_26::numeric, 0)
-        + COALESCE(total_quantity_29::numeric, 0)                        AS plan_allotted_g
-    FROM db_treatment_plans
-    WHERE email IS NOT NULL
-      AND (total_quantity_22 IS NOT NULL
-        OR total_quantity_26 IS NOT NULL
-        OR total_quantity_29 IS NOT NULL)
-    ORDER BY email, source_created_at DESC
+      interval_key,
+      supply_interval_total     AS allotted_this_interval,
+      supply_used_interval      AS used_this_interval,
+      supply_remaining_interval AS remaining_this_interval,
+      supply_remaining_repeats  AS remaining_repeats_snapshot
+    FROM supply_tracking
+    WHERE supply_interval_total IS NOT NULL AND supply_interval_total::numeric > 0
+    ORDER BY email, interval_key, source_created_at DESC
   ),
-  -- Saleor orders = consumed grams (filtered by date range when provided).
+  allowance_totals AS (
+    SELECT
+      email,
+      COUNT(*)::int                                AS repeat_count,
+      SUM(allotted_this_interval::numeric)         AS allotted_g,
+      AVG(remaining_this_interval::numeric)        AS avg_remaining_g,
+      AVG(allotted_this_interval::numeric)         AS avg_allotted_g,
+      MIN(remaining_repeats_snapshot)              AS repeats_remaining
+    FROM supply_by_interval
+    GROUP BY email
+  ),
+  -- Saleor orders = consumed grams cross-reference (filtered by date range when provided).
   saleor_used AS (
     SELECT
       email,
@@ -341,24 +351,26 @@ function buildHealthQuery(from?: string, to?: string) {
     c.name                                                                 AS patient_name,
     zc.email                                                               AS email,
     (c.created_at AT TIME ZONE 'Australia/Sydney')::date                  AS signed_up,
-    su.order_count                                                         AS repeat_count,
-    NULL::int                                                              AS repeats_remaining,
-    ROUND(tp.plan_allotted_g, 1)                                          AS allotted_g,
+    at.repeat_count                                                        AS repeat_count,
+    at.repeats_remaining                                                   AS repeats_remaining,
+    ROUND(at.allotted_g, 1)                                               AS allotted_g,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS bought_g,
-    ROUND(GREATEST(tp.plan_allotted_g - COALESCE(su.used_g, 0), 0), 1)   AS avg_remaining_g,
-    ROUND(COALESCE(su.used_g, 0) / NULLIF(tp.plan_allotted_g, 0) * 100, 1) AS allowance_pct,
+    ROUND(at.avg_remaining_g, 1)                                          AS avg_remaining_g,
+    ROUND(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) * 100, 1)   AS allowance_pct,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
-    tp.plan_allotted_g                                                     AS avg_allotted_g,
+    at.avg_allotted_g                                                     AS avg_allotted_g,
     CASE
-      WHEN tp.plan_allotted_g IS NULL OR tp.plan_allotted_g = 0           THEN 'red'
-      WHEN GREATEST(tp.plan_allotted_g - COALESCE(su.used_g, 0), 0)
-             / tp.plan_allotted_g < 0.25
-           AND COALESCE(su.order_count, 0)         >= 3
-           AND COALESCE(se.purchase_rate_pct, 100) >= 60                  THEN 'purple'
-      WHEN GREATEST(tp.plan_allotted_g - COALESCE(su.used_g, 0), 0)
-             / tp.plan_allotted_g < 0.50                                  THEN 'green'
-      WHEN GREATEST(tp.plan_allotted_g - COALESCE(su.used_g, 0), 0)
-             / tp.plan_allotted_g < 0.75                                  THEN 'orange'
+      WHEN (at.allotted_g IS NULL OR at.allotted_g = 0)
+           AND zc.supply_date IS NOT NULL                                  THEN 'red'
+      WHEN at.allotted_g IS NULL OR at.allotted_g = 0                     THEN NULL
+      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+             / at.allotted_g < 0.25
+           AND COALESCE(at.repeat_count, 0)         >= 3
+           AND COALESCE(se.purchase_rate_pct, 100)  >= 60                 THEN 'purple'
+      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+             / at.allotted_g < 0.50                                       THEN 'green'
+      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+             / at.allotted_g < 0.75                                       THEN 'orange'
       ELSE 'red'
     END                                                                    AS allowance_group,
     se.total_visits,
@@ -380,49 +392,38 @@ function buildHealthQuery(from?: string, to?: string) {
       ELSE NULL
     END                                                                    AS conversion_tier,
     CASE
-      WHEN COALESCE(su.used_g, 0) / NULLIF(tp.plan_allotted_g, 0) >= 0.75
+      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75
            AND se.avg_visits_per_month >= 4
            AND se.purchase_rate_pct    >= 60                              THEN 'loyal_power_buyer'
-      WHEN COALESCE(su.used_g, 0) / NULLIF(tp.plan_allotted_g, 0) >= 0.75 THEN 'high_adherent'
+      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75    THEN 'high_adherent'
       WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60
-           AND (tp.plan_allotted_g IS NULL
-             OR COALESCE(su.used_g, 0) / tp.plan_allotted_g < 0.75)      THEN 'active_partial_buyer'
+           AND (at.allotted_g IS NULL
+             OR COALESCE(su.used_g, 0) / at.allotted_g < 0.75)          THEN 'active_partial_buyer'
       WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 'window_shopper'
       WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 'casual_buyer'
       WHEN (se.avg_visits_per_month < 1 OR se.avg_visits_per_month IS NULL)
-           AND (tp.plan_allotted_g IS NULL
-             OR COALESCE(su.used_g, 0) / tp.plan_allotted_g < 0.25)      THEN 'at_risk'
+           AND (at.allotted_g IS NULL
+             OR COALESCE(su.used_g, 0) / at.allotted_g < 0.25)          THEN 'at_risk'
       ELSE 'needs_review'
     END                                                                    AS customer_pattern
   FROM zoho_contacts                                                        zc
-  LEFT JOIN treatment_plan_totals   tp  ON  tp.email       = zc.email
+  LEFT JOIN allowance_totals        at  ON  at.email       = zc.email
   LEFT JOIN saleor_used             su  ON  su.email       = zc.email
   LEFT JOIN shop_engagement         se  ON  se.email       = zc.email
   LEFT JOIN customers               c   ON  c.email        = zc.email
   WHERE zc.email IS NOT NULL
-    AND zc.email NOT LIKE '%@harvest.au'
-    AND zc.email NOT LIKE '%@harvest.delivery'
-    AND zc.email NOT LIKE '%@harvest.net.au'
-    AND zc.email NOT LIKE '%.demot@%'
-    AND zc.email NOT LIKE '%@test.com'
-    AND zc.email NOT LIKE '%@dev.co'
-    AND zc.email NOT IN (
-      'mailer-daemon@googlemail.com',
-      'noreply-dmarc-support@google.com',
-      'zohoflowfailed@outlook.com'
-    )
   ORDER BY
     CASE
-      WHEN COALESCE(su.used_g, 0) / NULLIF(tp.plan_allotted_g, 0) >= 0.75
+      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75
            AND se.avg_visits_per_month >= 4
            AND se.purchase_rate_pct    >= 60                              THEN 1
-      WHEN COALESCE(su.used_g, 0) / NULLIF(tp.plan_allotted_g, 0) >= 0.75 THEN 2
+      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75    THEN 2
       WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60   THEN 3
       WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 4
       WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 5
       ELSE 6
     END,
-    COALESCE(su.used_g, 0) / NULLIF(tp.plan_allotted_g, 0) DESC NULLS LAST
+    COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) DESC NULLS LAST
 `);
 }
 // Saleor is now the direct usage source in buildHealthQuery — no post-processing needed.
