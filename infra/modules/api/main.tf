@@ -53,6 +53,27 @@ resource "aws_cloudwatch_log_group" "sync" {
   tags = { Stage = var.stage, Service = var.service_name }
 }
 
+resource "aws_cloudwatch_log_group" "auth" {
+  name              = "/aws/lambda/${var.service_name}-api-auth-${var.stage}"
+  retention_in_days = 30
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
+resource "aws_cloudwatch_log_group" "users" {
+  name              = "/aws/lambda/${var.service_name}-api-users-${var.stage}"
+  retention_in_days = 30
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
+resource "aws_cloudwatch_log_group" "roles" {
+  name              = "/aws/lambda/${var.service_name}-api-roles-${var.stage}"
+  retention_in_days = 30
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
 # ── Placeholder zip (CI deploys real code via update-function-code) ────────────
 
 data "archive_file" "placeholder" {
@@ -70,6 +91,7 @@ locals {
   common_env = {
     DATABASE_URL = var.database_url
     NODE_ENV     = "production"
+    JWT_SECRET   = var.jwt_secret
   }
 }
 
@@ -160,6 +182,93 @@ resource "aws_lambda_function" "sync" {
   tags = { Stage = var.stage, Service = var.service_name }
 }
 
+resource "aws_lambda_function" "auth" {
+  function_name = "${var.service_name}-api-auth-${var.stage}"
+  role          = aws_iam_role.api.arn
+  runtime       = var.lambda_runtime
+  handler       = "auth.handler"
+  timeout       = 30
+  memory_size   = 256
+
+  filename         = data.archive_file.placeholder.output_path
+  source_code_hash = data.archive_file.placeholder.output_base64sha256
+
+  vpc_config {
+    subnet_ids         = var.vpc_subnet_ids
+    security_group_ids = var.vpc_security_group_ids
+  }
+
+  environment {
+    variables = local.common_env
+  }
+
+  depends_on = [aws_cloudwatch_log_group.auth]
+
+  lifecycle {
+    ignore_changes = [filename, source_code_hash]
+  }
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
+resource "aws_lambda_function" "users" {
+  function_name = "${var.service_name}-api-users-${var.stage}"
+  role          = aws_iam_role.api.arn
+  runtime       = var.lambda_runtime
+  handler       = "users.handler"
+  timeout       = 30
+  memory_size   = 256
+
+  filename         = data.archive_file.placeholder.output_path
+  source_code_hash = data.archive_file.placeholder.output_base64sha256
+
+  vpc_config {
+    subnet_ids         = var.vpc_subnet_ids
+    security_group_ids = var.vpc_security_group_ids
+  }
+
+  environment {
+    variables = local.common_env
+  }
+
+  depends_on = [aws_cloudwatch_log_group.users]
+
+  lifecycle {
+    ignore_changes = [filename, source_code_hash]
+  }
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
+resource "aws_lambda_function" "roles" {
+  function_name = "${var.service_name}-api-roles-${var.stage}"
+  role          = aws_iam_role.api.arn
+  runtime       = var.lambda_runtime
+  handler       = "roles.handler"
+  timeout       = 30
+  memory_size   = 256
+
+  filename         = data.archive_file.placeholder.output_path
+  source_code_hash = data.archive_file.placeholder.output_base64sha256
+
+  vpc_config {
+    subnet_ids         = var.vpc_subnet_ids
+    security_group_ids = var.vpc_security_group_ids
+  }
+
+  environment {
+    variables = local.common_env
+  }
+
+  depends_on = [aws_cloudwatch_log_group.roles]
+
+  lifecycle {
+    ignore_changes = [filename, source_code_hash]
+  }
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
 # ── Allow sync Lambda to invoke worker Lambdas ────────────────────────────────
 
 data "aws_iam_policy_document" "sync_invoke_workers" {
@@ -204,6 +313,27 @@ resource "aws_lambda_permission" "sync" {
   source_arn    = "${aws_apigatewayv2_api.analytics.execution_arn}/*/*"
 }
 
+resource "aws_lambda_permission" "auth" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.auth.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.analytics.execution_arn}/*/*"
+}
+
+resource "aws_lambda_permission" "users" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.users.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.analytics.execution_arn}/*/*"
+}
+
+resource "aws_lambda_permission" "roles" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.roles.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.analytics.execution_arn}/*/*"
+}
+
 # ── HTTP API Gateway ───────────────────────────────────────────────────────────
 
 resource "aws_apigatewayv2_api" "analytics" {
@@ -212,7 +342,7 @@ resource "aws_apigatewayv2_api" "analytics" {
 
   cors_configuration {
     allow_origins = var.allowed_origins != "" ? split(",", var.allowed_origins) : ["*"]
-    allow_methods = ["GET", "POST", "OPTIONS"]
+    allow_methods = ["GET", "POST", "PATCH", "OPTIONS"]
     allow_headers = ["Content-Type", "Authorization"]
     max_age       = 300
   }
@@ -299,6 +429,99 @@ resource "aws_apigatewayv2_route" "sync_trigger" {
   api_id    = aws_apigatewayv2_api.analytics.id
   route_key = "POST /sync/{source}"
   target    = "integrations/${aws_apigatewayv2_integration.sync.id}"
+}
+
+# ── Auth routes ────────────────────────────────────────────────────────────────
+
+resource "aws_apigatewayv2_integration" "auth" {
+  api_id                 = aws_apigatewayv2_api.analytics.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.auth.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "auth_login" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "POST /auth/login"
+  target    = "integrations/${aws_apigatewayv2_integration.auth.id}"
+}
+
+resource "aws_apigatewayv2_route" "auth_me" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /auth/me"
+  target    = "integrations/${aws_apigatewayv2_integration.auth.id}"
+}
+
+resource "aws_apigatewayv2_route" "auth_change_password" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "POST /auth/change-password"
+  target    = "integrations/${aws_apigatewayv2_integration.auth.id}"
+}
+
+# ── User management routes ─────────────────────────────────────────────────────
+
+resource "aws_apigatewayv2_integration" "users" {
+  api_id                 = aws_apigatewayv2_api.analytics.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.users.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "users_list" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /users"
+  target    = "integrations/${aws_apigatewayv2_integration.users.id}"
+}
+
+resource "aws_apigatewayv2_route" "users_create" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "POST /users"
+  target    = "integrations/${aws_apigatewayv2_integration.users.id}"
+}
+
+resource "aws_apigatewayv2_route" "users_update" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "PATCH /users/{id}"
+  target    = "integrations/${aws_apigatewayv2_integration.users.id}"
+}
+
+resource "aws_apigatewayv2_route" "users_deactivate" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "PATCH /users/{id}/deactivate"
+  target    = "integrations/${aws_apigatewayv2_integration.users.id}"
+}
+
+resource "aws_apigatewayv2_route" "users_reset_password" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "POST /users/{id}/reset-password"
+  target    = "integrations/${aws_apigatewayv2_integration.users.id}"
+}
+
+# ── Roles routes ───────────────────────────────────────────────────────────────
+
+resource "aws_apigatewayv2_integration" "roles" {
+  api_id                 = aws_apigatewayv2_api.analytics.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.roles.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "roles_pages" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /roles/pages"
+  target    = "integrations/${aws_apigatewayv2_integration.roles.id}"
+}
+
+resource "aws_apigatewayv2_route" "roles_list" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /roles"
+  target    = "integrations/${aws_apigatewayv2_integration.roles.id}"
+}
+
+resource "aws_apigatewayv2_route" "roles_create" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "POST /roles"
+  target    = "integrations/${aws_apigatewayv2_integration.roles.id}"
 }
 
 # ── Custom Domain (optional) ───────────────────────────────────────────────────

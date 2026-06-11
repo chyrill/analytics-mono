@@ -71,13 +71,14 @@ jobs:
           TF_VAR_zoho_refresh_token: ${{ secrets.ZOHO_REFRESH_TOKEN }}
           TF_VAR_saleor_api_token: ${{ secrets.SALEOR_API_TOKEN }}
           TF_VAR_docapp_database_url: ${{ secrets.DOCAPP_DATABASE_URL }}
+          TF_VAR_jwt_secret: ${{ secrets.JWT_SECRET }}
         run: terraform apply -auto-approve -var-file="tfvars/production.tfvars"
 
       # ── Package Lambda artifacts ─────────────────────────────────────────────
 
       - name: Package API Lambdas
         run: |
-          for HANDLER in customers ingest sync; do
+          for HANDLER in customers ingest sync auth users roles; do
             mkdir -p "/tmp/analytics-api-${HANDLER}"
             npx esbuild "apps/api/src/handlers/${HANDLER}.ts" \
               --bundle --platform=node --target=node20 \
@@ -115,7 +116,7 @@ jobs:
 
       - name: Deploy API Lambda function code
         run: |
-          for HANDLER in customers ingest sync; do
+          for HANDLER in customers ingest sync auth users roles; do
             aws lambda update-function-code \
               --function-name "harvest-analytics-api-${HANDLER}-production" \
               --zip-file "fileb:///tmp/analytics-api-${HANDLER}.zip" \

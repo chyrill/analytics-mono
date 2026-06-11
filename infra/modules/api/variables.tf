@@ -49,3 +49,8 @@ variable "create_route53_records" {
   type    = bool
   default = false
 }
+
+variable "jwt_secret" {
+  type      = string
+  sensitive = true
+}

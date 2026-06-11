@@ -57,6 +57,7 @@ module "api" {
   create_custom_domain   = var.create_custom_domain
   create_route53_records = var.create_route53_records
   allowed_origins        = var.allowed_origins
+  jwt_secret             = var.jwt_secret
 
   depends_on = [module.database]
 }

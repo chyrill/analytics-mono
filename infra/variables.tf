@@ -101,6 +101,11 @@ variable "docapp_database_url" {
   default   = ""
 }
 
+variable "jwt_secret" {
+  type      = string
+  sensitive = true
+}
+
 # ── Domains ────────────────────────────────────────────────────────────────────
 
 variable "api_domain_name" {
