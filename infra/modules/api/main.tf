@@ -74,6 +74,13 @@ resource "aws_cloudwatch_log_group" "roles" {
   tags = { Stage = var.stage, Service = var.service_name }
 }
 
+resource "aws_cloudwatch_log_group" "health" {
+  name              = "/aws/lambda/${var.service_name}-api-health-${var.stage}"
+  retention_in_days = 30
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
 # ── Placeholder zip (CI deploys real code via update-function-code) ────────────
 
 data "archive_file" "placeholder" {
@@ -269,6 +276,35 @@ resource "aws_lambda_function" "roles" {
   tags = { Stage = var.stage, Service = var.service_name }
 }
 
+resource "aws_lambda_function" "health" {
+  function_name = "${var.service_name}-api-health-${var.stage}"
+  role          = aws_iam_role.api.arn
+  runtime       = var.lambda_runtime
+  handler       = "health.handler"
+  timeout       = 60
+  memory_size   = 512
+
+  filename         = data.archive_file.placeholder.output_path
+  source_code_hash = data.archive_file.placeholder.output_base64sha256
+
+  vpc_config {
+    subnet_ids         = var.vpc_subnet_ids
+    security_group_ids = var.vpc_security_group_ids
+  }
+
+  environment {
+    variables = local.common_env
+  }
+
+  depends_on = [aws_cloudwatch_log_group.health]
+
+  lifecycle {
+    ignore_changes = [filename, source_code_hash]
+  }
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
 # ── Allow sync Lambda to invoke worker Lambdas ────────────────────────────────
 
 data "aws_iam_policy_document" "sync_invoke_workers" {
@@ -330,6 +366,13 @@ resource "aws_lambda_permission" "users" {
 resource "aws_lambda_permission" "roles" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.roles.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.analytics.execution_arn}/*/*"
+}
+
+resource "aws_lambda_permission" "health" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.health.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.analytics.execution_arn}/*/*"
 }
@@ -522,6 +565,33 @@ resource "aws_apigatewayv2_route" "roles_create" {
   api_id    = aws_apigatewayv2_api.analytics.id
   route_key = "POST /roles"
   target    = "integrations/${aws_apigatewayv2_integration.roles.id}"
+}
+
+# ── Health routes ──────────────────────────────────────────────────────────────
+
+resource "aws_apigatewayv2_integration" "health" {
+  api_id                 = aws_apigatewayv2_api.analytics.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.health.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "health_data" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /health-data"
+  target    = "integrations/${aws_apigatewayv2_integration.health.id}"
+}
+
+resource "aws_apigatewayv2_route" "health_data_export" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /health-data/export"
+  target    = "integrations/${aws_apigatewayv2_integration.health.id}"
+}
+
+resource "aws_apigatewayv2_route" "health_detail" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /health-detail"
+  target    = "integrations/${aws_apigatewayv2_integration.health.id}"
 }
 
 # ── Custom Domain (optional) ───────────────────────────────────────────────────
