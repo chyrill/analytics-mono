@@ -81,6 +81,7 @@ jobs:
             mkdir -p "/tmp/analytics-api-${HANDLER}"
             npx esbuild "apps/api/src/handlers/${HANDLER}.ts" \
               --bundle --platform=node --target=node20 \
+              --conditions=require \
               --outfile="/tmp/analytics-api-${HANDLER}/${HANDLER}.js" \
               --external:pg-native
             cd "/tmp/analytics-api-${HANDLER}" && zip -r "/tmp/analytics-api-${HANDLER}.zip" . && cd -
@@ -92,6 +93,7 @@ jobs:
             mkdir -p "/tmp/analytics-sync-${HANDLER}"
             npx esbuild "apps/sync/src/handlers/${HANDLER}.ts" \
               --bundle --platform=node --target=node20 \
+              --conditions=require \
               --outfile="/tmp/analytics-sync-${HANDLER}/${HANDLER}.js" \
               --external:pg-native
             cd "/tmp/analytics-sync-${HANDLER}" && zip -r "/tmp/analytics-sync-${HANDLER}.zip" . && cd -
@@ -103,6 +105,7 @@ jobs:
           rm -rf "$BUNDLE_DIR" && mkdir -p "$BUNDLE_DIR"
           npx esbuild packages/db/src/migrate-lambda.ts \
             --bundle --platform=node --target=node20 \
+            --conditions=require \
             --outfile="$BUNDLE_DIR/index.js" \
             --external:pg-native
           cp -r packages/db/migrations "$BUNDLE_DIR/migrations"
