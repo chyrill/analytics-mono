@@ -26,8 +26,10 @@ export TF_VAR_zoho_refresh_token="$(_env ZOHO_REFRESH_TOKEN)"
 export TF_VAR_saleor_api_token="$(_env SALEOR_API_TOKEN)"
 export TF_VAR_docapp_database_url="$(_env DOCAPP_DATABASE_URL)"
 export TF_VAR_db_password="$(_env ANALYTICS_DB_PASSWORD)"
+export TF_VAR_jwt_secret="$(_env JWT_SECRET)"
 
 [[ -z "${TF_VAR_db_password}" ]] && { echo "ERROR: ANALYTICS_DB_PASSWORD not set in $ENV_FILE"; exit 1; }
+[[ -z "${TF_VAR_jwt_secret}" ]] && { echo "ERROR: JWT_SECRET not set in $ENV_FILE"; exit 1; }
 
 echo "==> Initialising Terraform (backend: s3://harvest-infra/analytics-mono/production/)"
 cd "$SCRIPT_DIR"
