@@ -748,11 +748,11 @@ app.get("/all-patients", async (_req, res) => {
 const DOCAPP_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 type PeriodBounds = [string, string]; // [gte, lt)
 const DOCAPP_PERIOD_BOUNDS: Record<string, PeriodBounds | null> = {
-  all:       null,
-  this_week: ["DATE_TRUNC('week', CURRENT_DATE)",                      "DATE_TRUNC('week', CURRENT_DATE) + INTERVAL '7 days'"],
-  last_week: ["DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'",  "DATE_TRUNC('week', CURRENT_DATE)"],
-  last_30d:  ["CURRENT_DATE - INTERVAL '29 days'",                     "CURRENT_DATE + INTERVAL '1 day'"],
-  last_90d:  ["CURRENT_DATE - INTERVAL '89 days'",                     "CURRENT_DATE + INTERVAL '1 day'"],
+  all: null,
+  this_week: ["DATE_TRUNC('week', CURRENT_DATE)", "DATE_TRUNC('week', CURRENT_DATE) + INTERVAL '7 days'"],
+  last_week: ["DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'", "DATE_TRUNC('week', CURRENT_DATE)"],
+  last_30d: ["CURRENT_DATE - INTERVAL '29 days'", "CURRENT_DATE + INTERVAL '1 day'"],
+  last_90d: ["CURRENT_DATE - INTERVAL '89 days'", "CURRENT_DATE + INTERVAL '1 day'"],
 };
 
 function buildDocAppPeriodFilter(req: Request): {
@@ -761,9 +761,9 @@ function buildDocAppPeriodFilter(req: Request): {
   activePeriod: string;
 } {
   const rawFrom = (req.query.from as string | undefined)?.trim();
-  const rawTo   = (req.query.to   as string | undefined)?.trim();
+  const rawTo = (req.query.to as string | undefined)?.trim();
   const safeFrom = rawFrom && DOCAPP_DATE_RE.test(rawFrom) ? rawFrom : null;
-  const safeTo   = rawTo   && DOCAPP_DATE_RE.test(rawTo)   ? rawTo   : null;
+  const safeTo = rawTo && DOCAPP_DATE_RE.test(rawTo) ? rawTo : null;
 
   if (safeFrom) {
     // Custom range — use validated strings cast as ::date
@@ -1057,11 +1057,11 @@ app.get("/funnel-drop-waterfall", async (req, res) => {
 
     res.json({
       stages: [
-        { stage: "registered",           label: "Registered",            count: w.registered,             pct_of_registered: 100,                              pct_of_prev: 100 },
-        { stage: "questionnaire",        label: "Questionnaire complete", count: w.reached_questionnaire,  pct_of_registered: rate(w.reached_questionnaire, w.registered),  pct_of_prev: rate(w.reached_questionnaire, w.registered) },
-        { stage: "discharge",            label: "Discharge letter",       count: w.reached_discharge,      pct_of_registered: rate(w.reached_discharge, w.registered),       pct_of_prev: rate(w.reached_discharge, w.reached_questionnaire) },
-        { stage: "fees",                 label: "Consultation fee paid",  count: w.reached_fees,           pct_of_registered: rate(w.reached_fees, w.registered),            pct_of_prev: rate(w.reached_fees, w.reached_discharge) },
-        { stage: "treatmentplan",        label: "Treatment plan",         count: w.reached_treatmentplan,  pct_of_registered: rate(w.reached_treatmentplan, w.registered),   pct_of_prev: rate(w.reached_treatmentplan, w.reached_fees) },
+        { stage: "registered", label: "Registered", count: w.registered, pct_of_registered: 100, pct_of_prev: 100 },
+        { stage: "questionnaire", label: "Questionnaire complete", count: w.reached_questionnaire, pct_of_registered: rate(w.reached_questionnaire, w.registered), pct_of_prev: rate(w.reached_questionnaire, w.registered) },
+        { stage: "discharge", label: "Discharge letter", count: w.reached_discharge, pct_of_registered: rate(w.reached_discharge, w.registered), pct_of_prev: rate(w.reached_discharge, w.reached_questionnaire) },
+        { stage: "fees", label: "Consultation fee paid", count: w.reached_fees, pct_of_registered: rate(w.reached_fees, w.registered), pct_of_prev: rate(w.reached_fees, w.reached_discharge) },
+        { stage: "treatmentplan", label: "Treatment plan", count: w.reached_treatmentplan, pct_of_registered: rate(w.reached_treatmentplan, w.registered), pct_of_prev: rate(w.reached_treatmentplan, w.reached_fees) },
       ],
       consent_no_booking: (consentGap[0] as unknown as { consent_no_booking: number })?.consent_no_booking ?? 0,
       fetchedAt: new Date(),
