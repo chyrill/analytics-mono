@@ -20,14 +20,31 @@ variable "lambda_runtime" {
 
 # ── Networking ─────────────────────────────────────────────────────────────────
 
-variable "vpc_subnet_ids" {
-  type        = list(string)
-  description = "Private subnet IDs for Lambda VPC attachment and RDS subnet group"
+variable "vpc_id" {
+  type        = string
+  description = "Existing VPC ID — analytics subnets and security groups will be created inside it"
 }
 
-variable "vpc_security_group_ids" {
-  type        = list(string)
-  description = "Security group IDs to attach to Lambda functions"
+variable "public_subnet_id" {
+  type        = string
+  description = "An existing public subnet ID in the VPC — used to place the NAT gateway"
+}
+
+variable "subnet_cidr_az_a" {
+  type        = string
+  description = "CIDR for the new analytics private subnet in ap-southeast-2a"
+  default     = "172.31.48.0/24"
+}
+
+variable "subnet_cidr_az_b" {
+  type        = string
+  description = "CIDR for the new analytics private subnet in ap-southeast-2b"
+  default     = "172.31.49.0/24"
+}
+
+variable "docapp_rds_security_group_id" {
+  type        = string
+  description = "Security group ID of the doc-app production RDS (postgresqlDB) — an ingress rule will be added to allow analytics Lambda access"
 }
 
 # ── Database ───────────────────────────────────────────────────────────────────

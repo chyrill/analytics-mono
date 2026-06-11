@@ -71,8 +71,6 @@ jobs:
           TF_VAR_zoho_refresh_token: ${{ secrets.ZOHO_REFRESH_TOKEN }}
           TF_VAR_saleor_api_token: ${{ secrets.SALEOR_API_TOKEN }}
           TF_VAR_docapp_database_url: ${{ secrets.DOCAPP_DATABASE_URL }}
-          TF_VAR_vpc_subnet_ids: ${{ vars.TF_VPC_SUBNET_IDS }}
-          TF_VAR_vpc_security_group_ids: ${{ vars.TF_VPC_SECURITY_GROUP_IDS }}
         run: terraform apply -auto-approve -var-file="tfvars/production.tfvars"
 
       # ── Package Lambda artifacts ─────────────────────────────────────────────
