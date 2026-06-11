@@ -32,7 +32,7 @@ hosted_zone_id  = "" # fill in Route53 hosted zone ID if using create_route53_re
 create_custom_domain   = true
 create_route53_records = false # set true if domain is managed in Route53
 
-allowed_origins = "https://analytics.zenith.clinic"
+allowed_origins = "https://analytics.simdoar.net"
 
 enable_frontend = true
 
