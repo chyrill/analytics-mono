@@ -216,10 +216,10 @@ export default function DashboardPage() {
 
     fetch(`${API_BASE}/sync/${source}`, { method: "POST" })
       .then((r) => {
-        if (r.status === 409) return r.json().then((d: { job_id: string }) => { pollJob(source, d.job_id); return null; });
-        return r.json() as Promise<{ job_id: string }>;
+        if (r.status === 409) return r.json().then((d: { id: string }) => { pollJob(source, d.id); return null; });
+        return r.json() as Promise<{ id: string }>;
       })
-      .then((data) => { if (data) pollJob(source, data.job_id); })
+      .then((data) => { if (data) pollJob(source, data.id); })
       .catch(() => setSyncing((prev) => ({ ...prev, [source]: false })));
   }
 
