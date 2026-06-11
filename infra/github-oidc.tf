@@ -26,7 +26,7 @@ data "aws_iam_policy_document" "github_actions_assume" {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
       # Allow main branch pushes and workflow_dispatch with environment
-      values = ["repo:chyrill/analytics-mono:*"]
+      values = ["repo:theharvest420/analytics-mono:*"]
     }
   }
 }
