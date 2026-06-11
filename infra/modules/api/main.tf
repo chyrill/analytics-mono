@@ -46,6 +46,13 @@ resource "aws_cloudwatch_log_group" "customers" {
   tags = { Stage = var.stage, Service = var.service_name }
 }
 
+resource "aws_cloudwatch_log_group" "sync" {
+  name              = "/aws/lambda/${var.service_name}-api-sync-${var.stage}"
+  retention_in_days = 30
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
 # ── Placeholder zip (CI deploys real code via update-function-code) ────────────
 
 data "archive_file" "placeholder" {
@@ -124,6 +131,56 @@ resource "aws_lambda_function" "customers" {
   tags = { Stage = var.stage, Service = var.service_name }
 }
 
+resource "aws_lambda_function" "sync" {
+  function_name = "${var.service_name}-api-sync-${var.stage}"
+  role          = aws_iam_role.api.arn
+  runtime       = var.lambda_runtime
+  handler       = "sync.handler"
+  timeout       = 30
+  memory_size   = 256
+
+  filename         = data.archive_file.placeholder.output_path
+  source_code_hash = data.archive_file.placeholder.output_base64sha256
+
+  vpc_config {
+    subnet_ids         = var.vpc_subnet_ids
+    security_group_ids = var.vpc_security_group_ids
+  }
+
+  environment {
+    variables = merge(local.common_env, { STAGE = var.stage })
+  }
+
+  depends_on = [aws_cloudwatch_log_group.sync]
+
+  lifecycle {
+    ignore_changes = [filename, source_code_hash]
+  }
+
+  tags = { Stage = var.stage, Service = var.service_name }
+}
+
+# ── Allow sync Lambda to invoke worker Lambdas ────────────────────────────────
+
+data "aws_iam_policy_document" "sync_invoke_workers" {
+  statement {
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [
+      "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.service_name}-sync-*-${var.stage}",
+    ]
+  }
+}
+
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+
+resource "aws_iam_role_policy" "sync_invoke_workers" {
+  name   = "sync-invoke-workers"
+  role   = aws_iam_role.api.id
+  policy = data.aws_iam_policy_document.sync_invoke_workers.json
+}
+
 # ── Lambda permissions for API Gateway ────────────────────────────────────────
 
 resource "aws_lambda_permission" "ingest" {
@@ -136,6 +193,13 @@ resource "aws_lambda_permission" "ingest" {
 resource "aws_lambda_permission" "customers" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.customers.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.analytics.execution_arn}/*/*"
+}
+
+resource "aws_lambda_permission" "sync" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.sync.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.analytics.execution_arn}/*/*"
 }
@@ -210,6 +274,31 @@ resource "aws_apigatewayv2_route" "customers" {
   api_id    = aws_apigatewayv2_api.analytics.id
   route_key = "GET /customers"
   target    = "integrations/${aws_apigatewayv2_integration.customers.id}"
+}
+
+resource "aws_apigatewayv2_integration" "sync" {
+  api_id                 = aws_apigatewayv2_api.analytics.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.sync.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "sync_checkpoints" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /sync/checkpoints"
+  target    = "integrations/${aws_apigatewayv2_integration.sync.id}"
+}
+
+resource "aws_apigatewayv2_route" "sync_jobs" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /sync/jobs/{jobId}"
+  target    = "integrations/${aws_apigatewayv2_integration.sync.id}"
+}
+
+resource "aws_apigatewayv2_route" "sync_trigger" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "POST /sync/{source}"
+  target    = "integrations/${aws_apigatewayv2_integration.sync.id}"
 }
 
 # ── Custom Domain (optional) ───────────────────────────────────────────────────
