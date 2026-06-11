@@ -19,10 +19,16 @@ interface Customer {
   updatedAt: string;
 }
 
-interface SyncResult {
-  ok: boolean;
-  results: Record<string, string | number>;
-  syncedAt: string;
+interface SyncJobStatus {
+  id: string;
+  source: string;
+  mode: string;
+  status: string;
+  recordsFetched: number | null;
+  recordsUpserted: number | null;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
 }
 
 interface CustomersResponse {
@@ -67,42 +73,44 @@ async function fetchCustomers(): Promise<CustomersResponse> {
 
 // ── Source chip config ─────────────────────────────────────────────────────────
 const SOURCE_CHIPS = [
-  { key: "saleor+docapp",        color: "#22c55e", label: "Saleor + DocApp",  tip: "Email matched in both systems — fully reconciled patient." },
-  { key: "zoho+saleor+docapp",   color: "#a855f7", label: "All three",        tip: "Present in Zoho, Saleor, and DocApp." },
-  { key: "saleor",               color: "#60a5fa", label: "Saleor only",      tip: "Customer exists in the Saleor shop but no DocApp record." },
-  { key: "docapp",               color: "#facc15", label: "DocApp only",      tip: "Patient in DocApp without a matching Saleor account." },
-  { key: "zoho",                 color: "#f472b6", label: "Zoho only",        tip: "Contact in Zoho CRM only — not yet in other systems." },
-  { key: "zoho+saleor",          color: "#c084fc", label: "Zoho + Saleor",    tip: "In Zoho and Saleor but no DocApp patient record." },
-  { key: "zoho+docapp",          color: "#34d399", label: "Zoho + DocApp",    tip: "In Zoho and DocApp but no Saleor account." },
+  { key: "saleor+docapp", color: "#22c55e", label: "Saleor + DocApp", tip: "Email matched in both systems — fully reconciled patient." },
+  { key: "zoho+saleor+docapp", color: "#a855f7", label: "All three", tip: "Present in Zoho, Saleor, and DocApp." },
+  { key: "saleor", color: "#60a5fa", label: "Saleor only", tip: "Customer exists in the Saleor shop but no DocApp record." },
+  { key: "docapp", color: "#facc15", label: "DocApp only", tip: "Patient in DocApp without a matching Saleor account." },
+  { key: "zoho", color: "#f472b6", label: "Zoho only", tip: "Contact in Zoho CRM only — not yet in other systems." },
+  { key: "zoho+saleor", color: "#c084fc", label: "Zoho + Saleor", tip: "In Zoho and Saleor but no DocApp patient record." },
+  { key: "zoho+docapp", color: "#34d399", label: "Zoho + DocApp", tip: "In Zoho and DocApp but no Saleor account." },
 ] as const;
 
 const SOURCE_COLORS: Record<string, string> = {
-  "saleor+docapp":      "#22c55e",
+  "saleor+docapp": "#22c55e",
   "zoho+saleor+docapp": "#a855f7",
-  saleor:               "#60a5fa",
-  docapp:               "#facc15",
-  zoho:                 "#f472b6",
-  "zoho+saleor":        "#c084fc",
-  "zoho+docapp":        "#34d399",
-  unknown:              "#444",
+  saleor: "#60a5fa",
+  docapp: "#facc15",
+  zoho: "#f472b6",
+  "zoho+saleor": "#c084fc",
+  "zoho+docapp": "#34d399",
+  unknown: "#444",
 };
 
 // ── Component ──────────────────────────────────────────────────────────────────
 export default function DashboardPage() {
-  const [allRows, setAllRows]       = useState<Customer[]>([]);
-  const [dbTotal, setDbTotal]       = useState(0);
-  const [loading, setLoading]       = useState(true);
-  const [error, setError]           = useState<string | null>(null);
-  const [syncing, setSyncing]       = useState(false);
-  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const [allRows, setAllRows] = useState<Customer[]>([]);
+  const [dbTotal, setDbTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState<Record<string, boolean>>({});
+  const [syncJobs, setSyncJobs] = useState<Record<string, SyncJobStatus | null>>({});
+  const [isFirstSync, setIsFirstSync] = useState(false);
+  const pollTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   // Controls
-  const [search, setSearch]             = useState("");
+  const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
   const [filterSource, setFilterSource] = useState("");
-  const [sortCol, setSortCol]           = useState("createdAt");
-  const [sortDir, setSortDir]           = useState<1 | -1>(-1);
-  const [page, setPage]                 = useState(1);
+  const [sortCol, setSortCol] = useState("createdAt");
+  const [sortDir, setSortDir] = useState<1 | -1>(-1);
+  const [page, setPage] = useState(1);
 
   // Detail panel
   const [panel, setPanel] = useState<Customer | null>(null);
@@ -117,7 +125,15 @@ export default function DashboardPage() {
       .finally(() => setLoading(false));
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    // Check if this is the first Zoho sync (no checkpoint yet)
+    fetch(`${API_BASE}/sync/checkpoints?source=zoho`)
+      .then((r) => r.json() as Promise<{ source: string; entity: string }[]>)
+      .then((rows) => { setIsFirstSync(rows.length === 0); })
+      .catch(() => { });
+    return () => { Object.values(pollTimers.current).forEach(clearTimeout); };
+  }, []);
 
   // Close panel on Escape
   useEffect(() => {
@@ -166,8 +182,8 @@ export default function DashboardPage() {
   }, [allRows, search, filterStatus, filterSource, sortCol, sortDir]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const safePage   = Math.min(page, totalPages);
-  const pageRows   = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const safePage = Math.min(page, totalPages);
+  const pageRows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   function handleSort(col: string) {
     if (sortCol === col) setSortDir((d) => (d === 1 ? -1 : 1));
@@ -175,14 +191,36 @@ export default function DashboardPage() {
     setPage(1);
   }
 
-  function handleSync() {
-    setSyncing(true);
-    setSyncResult(null);
-    fetch(`${API_BASE}/sync`, { method: "POST" })
-      .then((r) => r.json() as Promise<SyncResult>)
-      .then((result) => { setSyncResult(result); load(); })
-      .catch((e: Error) => setSyncResult({ ok: false, results: { error: e.message }, syncedAt: new Date().toISOString() }))
-      .finally(() => setSyncing(false));
+  function pollJob(source: string, jobId: string) {
+    const tick = () => {
+      fetch(`${API_BASE}/sync/jobs/${jobId}`)
+        .then((r) => r.json() as Promise<SyncJobStatus>)
+        .then((job) => {
+          if (job.status === "completed" || job.status === "failed") {
+            setSyncJobs((prev) => ({ ...prev, [source]: job }));
+            setSyncing((prev) => ({ ...prev, [source]: false }));
+            if (job.status === "completed") { load(); setIsFirstSync(false); }
+          } else {
+            pollTimers.current[source] = setTimeout(tick, 3000);
+          }
+        })
+        .catch(() => setSyncing((prev) => ({ ...prev, [source]: false })));
+    };
+    pollTimers.current[source] = setTimeout(tick, 3000);
+  }
+
+  function handleSyncSource(source: "zoho" | "saleor" | "db" | "docapp") {
+    setSyncing((prev) => ({ ...prev, [source]: true }));
+    setSyncJobs((prev) => ({ ...prev, [source]: null }));
+    clearTimeout(pollTimers.current[source]);
+
+    fetch(`${API_BASE}/sync/${source}`, { method: "POST" })
+      .then((r) => {
+        if (r.status === 409) return r.json().then((d: { job_id: string }) => { pollJob(source, d.job_id); return null; });
+        return r.json() as Promise<{ job_id: string }>;
+      })
+      .then((data) => { if (data) pollJob(source, data.job_id); })
+      .catch(() => setSyncing((prev) => ({ ...prev, [source]: false })));
   }
 
   function thStyle(col: string): React.CSSProperties {
@@ -223,21 +261,35 @@ export default function DashboardPage() {
           <Link href="/patients" style={{ fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px" }}>Patient Registry →</Link>
           <Link href="/health" style={{ fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px" }}>Customer Health →</Link>
           <Link href="/shop-analytics" style={{ fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px" }}>Shop Analytics →</Link>
-          {syncResult && (
-            <span style={{ fontSize: 12, color: syncResult.ok ? "#4ade80" : "#fbbf24" }}>
-              {syncResult.ok ? "✓" : "⚠"}{" "}
-              {Object.entries(syncResult.results)
-                .map(([k, v]) => `${k}: ${v}`)
-                .join(" · ")}{" "}
-              · {new Date(syncResult.syncedAt).toLocaleTimeString("en-AU")}
+          {isFirstSync && (
+            <span style={{ fontSize: 11, color: "#f59e0b", background: "#451a03", border: "1px solid #78350f", borderRadius: 5, padding: "4px 10px" }}>
+              First sync — may take a few minutes
             </span>
           )}
-          <button onClick={load} disabled={loading} style={ghostBtn}>
-            ⟳ Refresh
-          </button>
-          <button onClick={handleSync} disabled={syncing || loading} style={syncing ? { ...primaryBtn, background: "#374151", borderColor: "#4b5563", cursor: "not-allowed" } : primaryBtn}>
-            {syncing ? "Syncing…" : "Sync Data"}
-          </button>
+          {(["zoho", "saleor", "docapp", "db"] as const).map((src) => {
+            const job = syncJobs[src];
+            const busy = syncing[src];
+            return (
+              <span key={src} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                {job && (
+                  <span style={{ fontSize: 11, color: job.status === "completed" ? "#4ade80" : "#f87171" }}>
+                    {job.status === "completed" ? `✓ ${job.recordsUpserted ?? 0} rows` : `✗ ${job.errorMessage?.slice(0, 40) ?? "failed"}`}
+                  </span>
+                )}
+                <button
+                  onClick={() => handleSyncSource(src)}
+                  disabled={busy || loading}
+                  style={busy
+                    ? { ...ghostBtn, cursor: "not-allowed", opacity: 0.5 }
+                    : ghostBtn
+                  }
+                >
+                  {busy ? "…" : `Sync ${{ zoho: "Zoho", saleor: "Saleor", docapp: "DocApp", db: "DB" }[src]}`}
+                </button>
+              </span>
+            );
+          })}
+          <button onClick={load} disabled={loading} style={ghostBtn}>⟳ Refresh</button>
         </div>
       </header>
 
@@ -314,13 +366,13 @@ export default function DashboardPage() {
               <tr>
                 {(
                   [
-                    ["email",                "Email"],
-                    ["name",                 "Name"],
-                    ["_source",              "Source"],
+                    ["email", "Email"],
+                    ["name", "Name"],
+                    ["_source", "Source"],
                     ["reconciliationStatus", "Status"],
-                    ["saleorCustomerId",     "Saleor ID"],
-                    ["docAppPatientId",      "DocApp ID"],
-                    ["createdAt",            "Created"],
+                    ["saleorCustomerId", "Saleor ID"],
+                    ["docAppPatientId", "DocApp ID"],
+                    ["createdAt", "Created"],
                   ] as [string, string][]
                 ).map(([col, label]) => (
                   <th key={col} style={thStyle(col)} onClick={() => handleSort(col)}>
@@ -453,10 +505,10 @@ export default function DashboardPage() {
             {/* Panel stat grid */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, background: "#1a1a1a", borderBottom: "1px solid #1a1a1a" }}>
               {[
-                ["Saleor ID",  panel.saleorCustomerId ?? "—"],
-                ["DocApp ID",  panel.docAppPatientId  ?? "—"],
-                ["Zoho ID",    panel.zohoContactId    ?? "—"],
-                ["Status",     panel.reconciliationStatus ?? "—"],
+                ["Saleor ID", panel.saleorCustomerId ?? "—"],
+                ["DocApp ID", panel.docAppPatientId ?? "—"],
+                ["Zoho ID", panel.zohoContactId ?? "—"],
+                ["Status", panel.reconciliationStatus ?? "—"],
               ].map(([label, val]) => (
                 <div key={label} style={{ background: "#141414", padding: "16px 16px", textAlign: "center" }}>
                   <div style={{ fontSize: 11, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>{label}</div>
@@ -469,10 +521,10 @@ export default function DashboardPage() {
             <div style={{ padding: "20px 24px" }}>
               <h3 style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", color: "#555", marginBottom: 14 }}>Record Details</h3>
               {[
-                ["Email",       panel.email],
-                ["Full name",   panel.name ?? "—"],
-                ["Created",     fmtDate(panel.createdAt)],
-                ["Updated",     fmtDate(panel.updatedAt)],
+                ["Email", panel.email],
+                ["Full name", panel.name ?? "—"],
+                ["Created", fmtDate(panel.createdAt)],
+                ["Updated", fmtDate(panel.updatedAt)],
               ].map(([label, val]) => (
                 <div key={label} style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #1a1a1a", fontSize: 13 }}>
                   <span style={{ color: "#555" }}>{label}</span>

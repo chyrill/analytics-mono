@@ -19,8 +19,10 @@ import { handler as customersHandler } from "./handlers/customers";
 import { handler as ingestHandler } from "./handlers/ingest";
 import { handler as saleorHandler } from "../../sync/src/handlers/saleor";
 import { handler as docAppHandler } from "../../sync/src/handlers/doc-app";
-import { db, customers, zohoContacts, zohoDeals } from "@analytics/db";
-import { sql, desc } from "drizzle-orm";
+import { runZohoSync } from "../../sync/src/handlers/zoho";
+import { runDocAppSync } from "../../sync/src/handlers/doc-app";
+import { db, customers, zohoContacts, zohoDeals, syncJobs, syncCheckpoints } from "@analytics/db";
+import { sql, desc, eq, and } from "drizzle-orm";
 import postgres from "postgres";
 
 // Drizzle with postgres-js returns RowList which extends Array directly — no .rows
@@ -96,26 +98,100 @@ app.options("/ingest", (req, res) => invoke(ingestHandler, req, res));
 app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date() }));
 
 const fakeEvent = {} as ScheduledEvent;
-const noop = () => {};
+const noop = () => { };
 
-app.post("/sync", async (_req, res) => {
-  const results: Record<string, unknown> = {};
+// ── Sync helpers ──────────────────────────────────────────────────────────────
 
-  await Promise.allSettled([
-    saleorHandler(fakeEvent, {} as never, noop).then(
-      () => { results.saleor = "ok"; },
-      (e: Error) => { results.saleor = e.message; },
-    ),
-    docAppHandler(fakeEvent, {} as never, noop).then(
-      () => { results.docapp = "ok"; },
-      (e: Error) => { results.docapp = e.message; },
-    ),
-  ]);
+async function checkInProgress(source: string) {
+  const rows = await db.select().from(syncJobs)
+    .where(and(eq(syncJobs.source, source), eq(syncJobs.status, "running")))
+    .limit(1);
+  return rows[0] ?? null;
+}
 
-  // Post-sync reconciliation: both syncs ran in parallel so the ON CONFLICT
-  // CASE expressions couldn't see what the peer sync wrote. Now that both are
-  // done we recompute status based on how many sources each email was found in.
-  const reconciled = await db.execute(sql`
+// ── POST /sync/zoho ───────────────────────────────────────────────────────────
+
+app.post("/sync/zoho", async (_req, res) => {
+  const inProgress = await checkInProgress("zoho");
+  if (inProgress) {
+    res.status(409).json({ error: "sync_in_progress", job_id: inProgress.id, started_at: inProgress.startedAt });
+    return;
+  }
+
+  const contactsCheckpoint = await db.select().from(syncCheckpoints)
+    .where(and(eq(syncCheckpoints.source, "zoho"), eq(syncCheckpoints.entity, "contacts")))
+    .limit(1);
+  const jobType = contactsCheckpoint.length > 0 ? "incremental" : "full";
+
+  const [job] = await db.insert(syncJobs).values({
+    source: "zoho",
+    mode: jobType,
+    entities: ["contacts", "deals", "calls", "tasks", "events"],
+    status: "running",
+    startedAt: new Date(),
+  }).returning();
+
+  res.status(202).json({ job_id: job.id, source: "zoho", job_type: jobType, status: "started" });
+
+  runZohoSync(job.id)
+    .then(({ fetched, upserted }) =>
+      db.update(syncJobs).set({ status: "completed", recordsFetched: fetched, recordsUpserted: upserted, completedAt: new Date() })
+        .where(eq(syncJobs.id, job.id)),
+    )
+    .catch((err: Error) =>
+      db.update(syncJobs).set({ status: "failed", errorMessage: err.message, completedAt: new Date() })
+        .where(eq(syncJobs.id, job.id)),
+    );
+});
+
+// ── POST /sync/saleor ─────────────────────────────────────────────────────────
+
+app.post("/sync/saleor", async (_req, res) => {
+  const inProgress = await checkInProgress("saleor");
+  if (inProgress) {
+    res.status(409).json({ error: "sync_in_progress", job_id: inProgress.id, started_at: inProgress.startedAt });
+    return;
+  }
+
+  const [job] = await db.insert(syncJobs).values({
+    source: "saleor", mode: "full", entities: ["customers", "orders"],
+    status: "running", startedAt: new Date(),
+  }).returning();
+
+  res.status(202).json({ job_id: job.id, source: "saleor", job_type: "full", status: "started" });
+
+  Promise.allSettled([
+    saleorHandler(fakeEvent, {} as never, noop),
+    docAppHandler(fakeEvent, {} as never, noop),
+  ]).then(async (results) => {
+    const failed = results.find((r) => r.status === "rejected");
+    if (failed) {
+      const msg = failed.status === "rejected" ? String((failed as PromiseRejectedResult).reason) : "";
+      await db.update(syncJobs).set({ status: "failed", errorMessage: msg, completedAt: new Date() })
+        .where(eq(syncJobs.id, job.id));
+      return;
+    }
+    await db.update(syncJobs).set({ status: "completed", completedAt: new Date() })
+      .where(eq(syncJobs.id, job.id));
+  });
+});
+
+// ── POST /sync/db ─────────────────────────────────────────────────────────────
+
+app.post("/sync/db", async (_req, res) => {
+  const inProgress = await checkInProgress("db");
+  if (inProgress) {
+    res.status(409).json({ error: "sync_in_progress", job_id: inProgress.id, started_at: inProgress.startedAt });
+    return;
+  }
+
+  const [job] = await db.insert(syncJobs).values({
+    source: "db", mode: "full", status: "running", startedAt: new Date(),
+  }).returning();
+
+  res.status(202).json({ job_id: job.id, source: "db", job_type: "full", status: "started" });
+
+  db.execute(sql`
     UPDATE customers
     SET reconciliation_status = CASE
       WHEN (
@@ -126,28 +202,104 @@ app.post("/sync", async (_req, res) => {
       ELSE 'gap'
     END,
     updated_at = now()
-  `);
-  results.reconciled = (reconciled as { rowCount?: number }).rowCount ?? "done";
-
-  const ok = ["saleor", "docapp"].every((k) => results[k] === "ok");
-  res
-    .status(ok ? 200 : 207)
-    .json({ ok, results, syncedAt: new Date() });
+  `)
+    .then(() => runDocAppSync(job.id))
+    .then(({ fetched, upserted }) =>
+      db.update(syncJobs).set({
+        status: "completed",
+        recordsFetched: fetched,
+        recordsUpserted: upserted,
+        completedAt: new Date(),
+      }).where(eq(syncJobs.id, job.id)),
+    )
+    .catch((err: Error) =>
+      db.update(syncJobs).set({ status: "failed", errorMessage: err.message, completedAt: new Date() })
+        .where(eq(syncJobs.id, job.id)),
+    );
 });
+
+// ── POST /sync/docapp ─────────────────────────────────────────────────────────
+
+app.post("/sync/docapp", async (_req, res) => {
+  const inProgress = await checkInProgress("docapp");
+  if (inProgress) {
+    res.status(409).json({ error: "sync_in_progress", job_id: inProgress.id, started_at: inProgress.startedAt });
+    return;
+  }
+
+  const patientsCheckpoint = await db.select().from(syncCheckpoints)
+    .where(and(eq(syncCheckpoints.source, "docapp"), eq(syncCheckpoints.entity, "patients")))
+    .limit(1);
+  const jobType = patientsCheckpoint.length > 0 ? "incremental" : "full";
+
+  const [job] = await db.insert(syncJobs).values({
+    source: "docapp",
+    mode: jobType,
+    entities: ["patients", "treatment_plans"],
+    status: "running",
+    startedAt: new Date(),
+  }).returning();
+
+  res.status(202).json({ job_id: job.id, source: "docapp", job_type: jobType, status: "started" });
+
+  runDocAppSync(job.id)
+    .then(({ fetched, upserted }) =>
+      db.update(syncJobs).set({ status: "completed", recordsFetched: fetched, recordsUpserted: upserted, completedAt: new Date() })
+        .where(eq(syncJobs.id, job.id)),
+    )
+    .catch((err: Error) =>
+      db.update(syncJobs).set({ status: "failed", errorMessage: err.message, completedAt: new Date() })
+        .where(eq(syncJobs.id, job.id)),
+    );
+});
+
+// ── GET /sync/jobs/:id ────────────────────────────────────────────────────────
+
+app.get("/sync/jobs/:id", async (req, res) => {
+  const rows = await db.select().from(syncJobs).where(eq(syncJobs.id, req.params.id)).limit(1);
+  if (!rows.length) { res.status(404).json({ error: "not_found" }); return; }
+  res.json(rows[0]);
+});
+
+// ── GET /sync/checkpoints ─────────────────────────────────────────────────────
+
+app.get("/sync/checkpoints", async (req, res) => {
+  const source = req.query.source as string | undefined;
+  const rows = source
+    ? await db.select().from(syncCheckpoints).where(eq(syncCheckpoints.source, source))
+    : await db.select().from(syncCheckpoints);
+  res.json(rows);
+});
+
+
 
 // ── Customer Health Index ─────────────────────────────────────────────────────
 // Queries the analytics DB directly — no dependency on customer-index service.
 // Replicates the enrichment logic from customer-index: Saleor order grams take
 // precedence when they exceed what doc-app supply tracking recorded.
 
-const HEALTH_QUERY = sql.raw(`
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function buildHealthQuery(from?: string, to?: string) {
+  const safeFrom = from && DATE_RE.test(from) ? from : null;
+  const safeTo = to && DATE_RE.test(to) ? to : null;
+
+  const saleorFilter = safeFrom
+    ? `\n    AND ordered_at >= '${safeFrom}'${safeTo ? ` AND ordered_at < '${safeTo}'` : ''}`
+    : '';
+  const cartFilter = safeFrom
+    ? `\n    AND source_created_at >= '${safeFrom}'${safeTo ? ` AND source_created_at < '${safeTo}'` : ''}`
+    : '';
+
+  return sql.raw(`
   WITH
+  -- Latest supply snapshot per distinct fill window (interval_key) for each patient.
   supply_by_interval AS (
     SELECT DISTINCT ON (email, interval_key)
       email,
       interval_key,
-      supply_interval_total  AS allotted_this_interval,
-      supply_used_interval   AS used_this_interval,
+      supply_interval_total     AS allotted_this_interval,
+      supply_used_interval      AS used_this_interval,
       supply_remaining_interval AS remaining_this_interval,
       supply_remaining_repeats  AS remaining_repeats_snapshot
     FROM supply_tracking
@@ -157,14 +309,22 @@ const HEALTH_QUERY = sql.raw(`
   allowance_totals AS (
     SELECT
       email,
-      COUNT(*)::int                                                        AS repeat_count,
-      SUM(used_this_interval::numeric)                                     AS bought_g,
-      SUM(allotted_this_interval::numeric)                                 AS allotted_g,
-      SUM(used_this_interval::numeric) / NULLIF(SUM(allotted_this_interval::numeric), 0) AS adherence_ratio,
-      AVG(remaining_this_interval::numeric)                                AS avg_remaining_g,
-      AVG(allotted_this_interval::numeric)                                 AS avg_allotted_g,
-      MIN(remaining_repeats_snapshot)                                      AS repeats_remaining
+      COUNT(*)::int                                AS repeat_count,
+      SUM(allotted_this_interval::numeric)         AS allotted_g,
+      AVG(remaining_this_interval::numeric)        AS avg_remaining_g,
+      AVG(allotted_this_interval::numeric)         AS avg_allotted_g,
+      MIN(remaining_repeats_snapshot)              AS repeats_remaining
     FROM supply_by_interval
+    GROUP BY email
+  ),
+  -- Saleor orders = consumed grams cross-reference (filtered by date range when provided).
+  saleor_used AS (
+    SELECT
+      email,
+      SUM(total_grams::numeric)  AS used_g,
+      COUNT(*)::int              AS order_count
+    FROM saleor_orders
+    WHERE email IS NOT NULL${saleorFilter}
     GROUP BY email
   ),
   shop_engagement AS (
@@ -184,34 +344,33 @@ const HEALTH_QUERY = sql.raw(`
       END                                                                  AS avg_days_between_visits,
       (MAX(source_created_at) AT TIME ZONE 'Australia/Sydney')::date       AS last_visit
     FROM cart_sessions
-    WHERE is_deleted = false AND email IS NOT NULL
-    GROUP BY email
-  ),
-  saleor_totals AS (
-    SELECT email, SUM(total_grams::numeric) AS saleor_total_g
-    FROM saleor_orders
+    WHERE is_deleted = false AND email IS NOT NULL${cartFilter}
     GROUP BY email
   )
   SELECT
     c.name                                                                 AS patient_name,
-    base.email                                                             AS email,
+    zc.email                                                               AS email,
     (c.created_at AT TIME ZONE 'Australia/Sydney')::date                  AS signed_up,
-    at.repeat_count,
-    at.repeats_remaining,
+    at.repeat_count                                                        AS repeat_count,
+    at.repeats_remaining                                                   AS repeats_remaining,
     ROUND(at.allotted_g, 1)                                               AS allotted_g,
-    ROUND(at.bought_g,   1)                                               AS bought_g,
+    ROUND(COALESCE(su.used_g, 0), 1)                                      AS bought_g,
     ROUND(at.avg_remaining_g, 1)                                          AS avg_remaining_g,
-    ROUND(at.adherence_ratio * 100, 1)                                    AS allowance_pct,
-    ROUND(st.saleor_total_g, 1)                                           AS saleor_total_g,
-    at.avg_allotted_g,
+    ROUND(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) * 100, 1)   AS allowance_pct,
+    ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
+    at.avg_allotted_g                                                     AS avg_allotted_g,
     CASE
-      WHEN at.avg_remaining_g IS NULL THEN NULL
-      WHEN (at.avg_remaining_g / NULLIF(at.avg_allotted_g, 0)) < 0.25
-           AND at.repeat_count    >= 4
-           AND at.adherence_ratio >= 0.75
-           AND COALESCE(se.purchase_rate_pct, 100) >= 60                  THEN 'purple'
-      WHEN (at.avg_remaining_g / NULLIF(at.avg_allotted_g, 0)) < 0.50    THEN 'green'
-      WHEN (at.avg_remaining_g / NULLIF(at.avg_allotted_g, 0)) < 0.75    THEN 'orange'
+      WHEN (at.allotted_g IS NULL OR at.allotted_g = 0)
+           AND zc.supply_date IS NOT NULL                                  THEN 'red'
+      WHEN at.allotted_g IS NULL OR at.allotted_g = 0                     THEN NULL
+      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+             / at.allotted_g < 0.25
+           AND COALESCE(at.repeat_count, 0)         >= 3
+           AND COALESCE(se.purchase_rate_pct, 100)  >= 60                 THEN 'purple'
+      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+             / at.allotted_g < 0.50                                       THEN 'green'
+      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+             / at.allotted_g < 0.75                                       THEN 'orange'
       ELSE 'red'
     END                                                                    AS allowance_group,
     se.total_visits,
@@ -233,87 +392,101 @@ const HEALTH_QUERY = sql.raw(`
       ELSE NULL
     END                                                                    AS conversion_tier,
     CASE
-      WHEN at.adherence_ratio >= 0.75 AND se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60 THEN 'loyal_power_buyer'
-      WHEN at.adherence_ratio >= 0.75 THEN 'high_adherent'
+      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75
+           AND se.avg_visits_per_month >= 4
+           AND se.purchase_rate_pct    >= 60                              THEN 'loyal_power_buyer'
+      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75    THEN 'high_adherent'
       WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60
-           AND (at.adherence_ratio IS NULL OR at.adherence_ratio < 0.75)  THEN 'active_partial_buyer'
+           AND (at.allotted_g IS NULL
+             OR COALESCE(su.used_g, 0) / at.allotted_g < 0.75)          THEN 'active_partial_buyer'
       WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 'window_shopper'
       WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 'casual_buyer'
       WHEN (se.avg_visits_per_month < 1 OR se.avg_visits_per_month IS NULL)
-           AND (at.adherence_ratio IS NULL OR at.adherence_ratio < 0.25)  THEN 'at_risk'
+           AND (at.allotted_g IS NULL
+             OR COALESCE(su.used_g, 0) / at.allotted_g < 0.25)          THEN 'at_risk'
       ELSE 'needs_review'
     END                                                                    AS customer_pattern
-  FROM (
-    SELECT DISTINCT email FROM saleor_orders    WHERE email IS NOT NULL
-    UNION
-    SELECT DISTINCT email FROM supply_tracking  WHERE email IS NOT NULL
-    UNION
-    SELECT DISTINCT email FROM cart_sessions    WHERE email IS NOT NULL AND is_deleted = false
-  )                                                                        base
-  LEFT JOIN  allowance_totals   at  ON  at.email = base.email
-  LEFT JOIN  shop_engagement    se  ON  se.email = base.email
-  LEFT JOIN  saleor_totals      st  ON  st.email = base.email
-  LEFT JOIN  customers          c   ON  c.email  = base.email
+  FROM zoho_contacts                                                        zc
+  LEFT JOIN allowance_totals        at  ON  at.email       = zc.email
+  LEFT JOIN saleor_used             su  ON  su.email       = zc.email
+  LEFT JOIN shop_engagement         se  ON  se.email       = zc.email
+  LEFT JOIN customers               c   ON  c.email        = zc.email
+  WHERE zc.email IS NOT NULL
   ORDER BY
     CASE
-      WHEN at.adherence_ratio >= 0.75 AND se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60 THEN 1
-      WHEN at.adherence_ratio >= 0.75                                                                  THEN 2
-      WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60                                THEN 3
-      WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30                                THEN 4
-      WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30                                 THEN 5
+      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75
+           AND se.avg_visits_per_month >= 4
+           AND se.purchase_rate_pct    >= 60                              THEN 1
+      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75    THEN 2
+      WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60   THEN 3
+      WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 4
+      WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 5
       ELSE 6
     END,
-    at.adherence_ratio DESC NULLS LAST
+    COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) DESC NULLS LAST
 `);
-
-// Mirrors enrichWithSaleor() from customer-index: recalculates allowance_group
-// when Saleor grams exceed what doc-app supply tracking recorded.
+}
+// Saleor is now the direct usage source in buildHealthQuery — no post-processing needed.
 function enrichWithSaleor(rows: Record<string, unknown>[]): Record<string, unknown>[] {
-  return rows.map((row) => {
-    const saleorG     = parseFloat(String(row.saleor_total_g ?? 0)) || 0;
-    const dbBoughtG   = parseFloat(String(row.bought_g   ?? 0)) || 0;
-    const allottedG   = parseFloat(String(row.allotted_g ?? 0)) || 0;
-    const repeatCount = Math.max(parseInt(String(row.repeat_count ?? 1)) || 1, 1);
-    const avgAllottedG = parseFloat(String(row.avg_allotted_g ?? 0)) || 0;
-
-    if (saleorG === 0 || (allottedG === 0 && dbBoughtG === 0)) return { ...row, avg_allotted_g: undefined };
-
-    const perIntervalG       = allottedG / repeatCount;
-    const effectiveUsedG     = Math.max(dbBoughtG, saleorG);
-    const inferredFills      = perIntervalG > 0 ? Math.ceil(effectiveUsedG / perIntervalG) : repeatCount;
-    const actualFills        = Math.max(inferredFills, repeatCount);
-    const effectiveAllottedG = Math.max(allottedG, inferredFills * perIntervalG);
-    const effectiveRemG      = effectiveAllottedG - effectiveUsedG;
-    const effectiveAvgRemG   = effectiveRemG / actualFills;
-    const ratio              = avgAllottedG > 0 ? effectiveAvgRemG / avgAllottedG : null;
-
-    const convRate  = parseFloat(String(row.purchase_rate_pct ?? 100));
-    const usageRate = effectiveAllottedG > 0 ? effectiveUsedG / effectiveAllottedG : 0;
-    const isActive  = actualFills >= 4 && usageRate >= 0.75 && convRate >= 60;
-
-    const allowance_group =
-      ratio === null          ? null     :
-      ratio < 0.25 && isActive ? "purple" :
-      ratio < 0.50             ? "green"  :
-      ratio < 0.75             ? "orange" : "red";
-
-    return {
-      ...row,
-      avg_allotted_g:  undefined,
-      repeat_count:    actualFills,
-      allotted_g:      Math.round(effectiveAllottedG * 10) / 10,
-      bought_g:        Math.round(effectiveUsedG * 10) / 10,
-      allowance_pct:   effectiveAllottedG > 0 ? Math.round(effectiveUsedG / effectiveAllottedG * 1000) / 10 : null,
-      avg_remaining_g: Math.round(effectiveAvgRemG * 10) / 10,
-      allowance_group,
-    };
-  });
+  return rows;
 }
 
-app.get("/health-data", async (_req, res) => {
+app.get("/health-data", async (req, res) => {
+  const from = (req.query.from as string | undefined)?.trim();
+  const to = (req.query.to as string | undefined)?.trim();
   try {
-    const rows = enrichWithSaleor(toRows(await db.execute(HEALTH_QUERY)));
+    const rows = enrichWithSaleor(toRows(await db.execute(buildHealthQuery(from, to))));
     res.json({ rows, count: rows.length });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    res.status(500).json({ error: msg });
+  }
+});
+
+app.get("/health-data/export", async (req, res) => {
+  const from = (req.query.from as string | undefined)?.trim();
+  const to = (req.query.to as string | undefined)?.trim();
+  const group = (req.query.group as string | undefined)?.trim(); // e.g. "noplan"
+  try {
+    const rows = enrichWithSaleor(toRows(await db.execute(buildHealthQuery(from, to))));
+    const filtered = group === "noplan"
+      ? rows.filter((r) => r.allowance_group == null)
+      : rows;
+
+    const cols: [string, string][] = [
+      ["patient_name", "Patient Name"],
+      ["email", "Email"],
+      ["allowance_group", "Group"],
+      ["allotted_g", "Allotted (g)"],
+      ["bought_g", "Bought (g)"],
+      ["avg_remaining_g", "Avg Rem (g)"],
+      ["allowance_pct", "Allowance %"],
+      ["repeat_count", "Orders"],
+      ["total_visits", "Visits"],
+      ["purchase_rate_pct", "Conv %"],
+      ["avg_visits_per_month", "Vis/mo"],
+      ["last_visit", "Last Visit"],
+      ["signed_up", "Signed Up"],
+      ["customer_pattern", "Pattern"],
+      ["visit_tier", "Visit Tier"],
+      ["conversion_tier", "Conv Tier"],
+    ];
+
+    const escape = (v: unknown) => {
+      const s = v == null ? "" : String(v);
+      return s.includes(",") || s.includes('"') || s.includes("\n")
+        ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+
+    const header = cols.map(([, label]) => label).join(",");
+    const body = filtered.map((r) =>
+      cols.map(([key]) => escape(r[key])).join(","),
+    ).join("\n");
+
+    const filename = group === "noplan" ? "no-plan-contacts.csv" : "health-contacts.csv";
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(`${header}\n${body}`);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     res.status(500).json({ error: msg });
@@ -378,29 +551,29 @@ app.get("/health-detail", async (req, res) => {
       `)),
     ]);
 
-    const allottedG  = (toRows<{ allotted_g: string | null }>(latestPlan)[0])?.allotted_g ?? null;
+    const allottedG = (toRows<{ allotted_g: string | null }>(latestPlan)[0])?.allotted_g ?? null;
     const gramsByMonth = toRows<{ month: string; month_ts: string; used_g: string }>(saleorGrams).map((r) => ({
       ...r, allotted_g: allottedG ? parseFloat(allottedG) : null,
     }));
 
-    const spendRows  = toRows<{ total_spent: string }>(spendByMonth);
-    const visitRows  = toRows<{ visits: string }>(visitsByMonth);
+    const spendRows = toRows<{ total_spent: string }>(spendByMonth);
+    const visitRows = toRows<{ visits: string }>(visitsByMonth);
     const totalSpent = spendRows.reduce((s, r) => s + parseFloat(r.total_spent || "0"), 0);
     const spendMonths = spendRows.length || 1;
     const totalVisits = visitRows.reduce((s, r) => s + parseInt(r.visits || "0"), 0);
-    const avgGrams   = gramsByMonth.length
+    const avgGrams = gramsByMonth.length
       ? gramsByMonth.reduce((s, r) => s + parseFloat(String(r.used_g)), 0) / gramsByMonth.length
       : 0;
 
     res.json({
-      visitsByMonth:    toRows(visitsByMonth),
+      visitsByMonth: toRows(visitsByMonth),
       gramsByMonth,
-      spendByMonth:     toRows(spendByMonth),
-      gramsPerOrder:    toRows(gramsPerOrder),
+      spendByMonth: toRows(spendByMonth),
+      gramsPerOrder: toRows(gramsPerOrder),
       summary: {
-        total_spent:            totalSpent.toFixed(2),
-        avg_monthly_spend:      (totalSpent / spendMonths).toFixed(2),
-        total_visits:           totalVisits,
+        total_spent: totalSpent.toFixed(2),
+        avg_monthly_spend: (totalSpent / spendMonths).toFixed(2),
+        total_visits: totalVisits,
         avg_grams_per_interval: avgGrams.toFixed(1),
       },
     });
@@ -481,51 +654,51 @@ app.get("/shop-analytics", async (_req, res) => {
       `)),
     ]);
 
-    type RevRow  = { month: string; revenue: string; orders: number; avg_order_value: string; grams_dispatched: string };
-    type VisRow  = { month: string; visits: number; purchases: number; conversion_rate: string };
-    const revRows  = toRows<RevRow>(revenue);
-    const visRows  = toRows<VisRow>(visits);
+    type RevRow = { month: string; revenue: string; orders: number; avg_order_value: string; grams_dispatched: string };
+    type VisRow = { month: string; visits: number; purchases: number; conversion_rate: string };
+    const revRows = toRows<RevRow>(revenue);
+    const visRows = toRows<VisRow>(visits);
     const thisMonth = revRows[revRows.length - 1] ?? {};
     const prevMonth = revRows[revRows.length - 2] ?? {};
     const thisVisit = visRows[visRows.length - 1] ?? {};
     const prevVisit = visRows[visRows.length - 2] ?? {};
 
-    const thisRev  = parseFloat(String((thisMonth as RevRow).revenue  ?? 0));
-    const prevRev  = parseFloat(String((prevMonth as RevRow).revenue  ?? 0));
+    const thisRev = parseFloat(String((thisMonth as RevRow).revenue ?? 0));
+    const prevRev = parseFloat(String((prevMonth as RevRow).revenue ?? 0));
     const thisConv = parseFloat(String((thisVisit as VisRow).conversion_rate ?? 0));
     const prevConv = parseFloat(String((prevVisit as VisRow).conversion_rate ?? 0));
-    const lapsedRows  = toRows(lapsed);
+    const lapsedRows = toRows(lapsed);
     const lapsedCount = lapsedRows.length;
-    const neverCount  = (toRows<{ count: number }>(neverBought)[0]?.count) ?? 0;
+    const neverCount = (toRows<{ count: number }>(neverBought)[0]?.count) ?? 0;
 
     const insights: { type: string; text: string }[] = [];
-    if (prevRev > 0 && thisRev > prevRev * 1.1)  insights.push({ type: "positive", text: `Revenue up ${Math.round((thisRev - prevRev) / prevRev * 100)}% vs last month` });
-    if (prevRev > 0 && thisRev < prevRev * 0.9)  insights.push({ type: "warning",  text: `Revenue down ${Math.round((prevRev - thisRev) / prevRev * 100)}% vs last month` });
-    if (thisConv > prevConv + 5)                  insights.push({ type: "positive", text: `Conversion rate improved ${(thisConv - prevConv).toFixed(1)}pp this month` });
-    if (thisConv < prevConv - 5)                  insights.push({ type: "alert",    text: `Conversion rate dropped ${(prevConv - thisConv).toFixed(1)}pp this month` });
-    if (lapsedCount > 20)                         insights.push({ type: "alert",    text: `${lapsedCount} patients lapsed (no order in 60+ days)` });
-    if (neverCount > 0)                           insights.push({ type: "neutral",  text: `${neverCount} patients have a treatment plan but have never ordered` });
+    if (prevRev > 0 && thisRev > prevRev * 1.1) insights.push({ type: "positive", text: `Revenue up ${Math.round((thisRev - prevRev) / prevRev * 100)}% vs last month` });
+    if (prevRev > 0 && thisRev < prevRev * 0.9) insights.push({ type: "warning", text: `Revenue down ${Math.round((prevRev - thisRev) / prevRev * 100)}% vs last month` });
+    if (thisConv > prevConv + 5) insights.push({ type: "positive", text: `Conversion rate improved ${(thisConv - prevConv).toFixed(1)}pp this month` });
+    if (thisConv < prevConv - 5) insights.push({ type: "alert", text: `Conversion rate dropped ${(prevConv - thisConv).toFixed(1)}pp this month` });
+    if (lapsedCount > 20) insights.push({ type: "alert", text: `${lapsedCount} patients lapsed (no order in 60+ days)` });
+    if (neverCount > 0) insights.push({ type: "neutral", text: `${neverCount} patients have a treatment plan but have never ordered` });
 
     res.json({
       kpis: {
-        revenue_this_month:    thisRev.toFixed(2),
-        revenue_prev_month:    prevRev.toFixed(2),
-        revenue_change_pct:    prevRev > 0 ? Math.round((thisRev - prevRev) / prevRev * 100) : null,
-        conversion_this:       thisConv,
-        conversion_prev:       prevConv,
-        conversion_change_pp:  prevConv > 0 ? Math.round(thisConv - prevConv) : null,
-        active_buyers_30d:     (toRows<{ count: number }>(activeBuyers)[0]?.count) ?? 0,
-        new_buyers_this_month: (toRows<{ count: number }>(newBuyers)[0]?.count)   ?? 0,
-        lapsed_60d:            lapsedCount,
-        never_purchased:       neverCount,
-        avg_order_value:       (thisMonth as RevRow).avg_order_value ?? "0",
-        avg_order_value_prev:  (prevMonth as RevRow).avg_order_value ?? "0",
-        orders_this_month:     (thisMonth as RevRow).orders ?? 0,
+        revenue_this_month: thisRev.toFixed(2),
+        revenue_prev_month: prevRev.toFixed(2),
+        revenue_change_pct: prevRev > 0 ? Math.round((thisRev - prevRev) / prevRev * 100) : null,
+        conversion_this: thisConv,
+        conversion_prev: prevConv,
+        conversion_change_pp: prevConv > 0 ? Math.round(thisConv - prevConv) : null,
+        active_buyers_30d: (toRows<{ count: number }>(activeBuyers)[0]?.count) ?? 0,
+        new_buyers_this_month: (toRows<{ count: number }>(newBuyers)[0]?.count) ?? 0,
+        lapsed_60d: lapsedCount,
+        never_purchased: neverCount,
+        avg_order_value: (thisMonth as RevRow).avg_order_value ?? "0",
+        avg_order_value_prev: (prevMonth as RevRow).avg_order_value ?? "0",
+        orders_this_month: (thisMonth as RevRow).orders ?? 0,
       },
-      revenueByMonth:      revRows,
-      conversionByMonth:   visRows,
-      saleorGramsByMonth:  toRows(saleorGrams),
-      lapsedPatients:      lapsedRows,
+      revenueByMonth: revRows,
+      conversionByMonth: visRows,
+      saleorGramsByMonth: toRows(saleorGrams),
+      lapsedPatients: lapsedRows,
       insights,
     });
   } catch (e: unknown) {
@@ -538,27 +711,27 @@ app.get("/shop-analytics", async (_req, res) => {
 app.get("/all-patients", async (_req, res) => {
   try {
     const rows = await db.select({
-      id:                   customers.id,
-      email:                customers.email,
-      name:                 customers.name,
-      docAppPatientId:      customers.docAppPatientId,
-      saleorCustomerId:     customers.saleorCustomerId,
-      zohoContactId:        customers.zohoContactId,
+      id: customers.id,
+      email: customers.email,
+      name: customers.name,
+      docAppPatientId: customers.docAppPatientId,
+      saleorCustomerId: customers.saleorCustomerId,
+      zohoContactId: customers.zohoContactId,
       reconciliationStatus: customers.reconciliationStatus,
-      createdAt:            customers.createdAt,
+      createdAt: customers.createdAt,
     })
-    .from(customers)
-    .orderBy(desc(customers.createdAt));
+      .from(customers)
+      .orderBy(desc(customers.createdAt));
 
     const out = rows.map((r) => ({
       ...r,
       has_docapp: r.docAppPatientId != null,
       has_saleor: r.saleorCustomerId != null,
-      has_zoho:   r.zohoContactId != null,
-      doc_app_patient_id:   r.docAppPatientId,
-      saleor_customer_id:   r.saleorCustomerId,
-      zoho_contact_id:      r.zohoContactId,
-      created_at:           r.createdAt,
+      has_zoho: r.zohoContactId != null,
+      doc_app_patient_id: r.docAppPatientId,
+      saleor_customer_id: r.saleorCustomerId,
+      zoho_contact_id: r.zohoContactId,
+      created_at: r.createdAt,
     }));
 
     res.json({ rows: out, total: out.length });
@@ -568,31 +741,52 @@ app.get("/all-patients", async (_req, res) => {
   }
 });
 
+// ── Shared period filter builder for doc-app endpoints ───────────────────────
+// Priority: custom ?from/to > preset ?period > all-time (no filter)
+// Date inputs MUST match YYYY-MM-DD. Validated strings are cast as ::date in
+// SQL — never interpolated raw — so injection is not possible.
+const DOCAPP_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+type PeriodBounds = [string, string]; // [gte, lt)
+const DOCAPP_PERIOD_BOUNDS: Record<string, PeriodBounds | null> = {
+  all: null,
+  this_week: ["DATE_TRUNC('week', CURRENT_DATE)", "DATE_TRUNC('week', CURRENT_DATE) + INTERVAL '7 days'"],
+  last_week: ["DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'", "DATE_TRUNC('week', CURRENT_DATE)"],
+  last_30d: ["CURRENT_DATE - INTERVAL '29 days'", "CURRENT_DATE + INTERVAL '1 day'"],
+  last_90d: ["CURRENT_DATE - INTERVAL '89 days'", "CURRENT_DATE + INTERVAL '1 day'"],
+};
+
+function buildDocAppPeriodFilter(req: Request): {
+  df: (col: string) => string;
+  bookingDateFilter: string;
+  activePeriod: string;
+} {
+  const rawFrom = (req.query.from as string | undefined)?.trim();
+  const rawTo = (req.query.to as string | undefined)?.trim();
+  const safeFrom = rawFrom && DOCAPP_DATE_RE.test(rawFrom) ? rawFrom : null;
+  const safeTo = rawTo && DOCAPP_DATE_RE.test(rawTo) ? rawTo : null;
+
+  if (safeFrom) {
+    // Custom range — use validated strings cast as ::date
+    const toClause = safeTo ? ` AND {col} < '${safeTo}'::date` : "";
+    const df = (col: string) => `AND ${col} >= '${safeFrom}'::date${toClause.replace("{col}", col)}`;
+    const bookingDateFilter = `AND r.date::date >= '${safeFrom}'::date${safeTo ? ` AND r.date::date < '${safeTo}'::date` : ""}`;
+    return { df, bookingDateFilter, activePeriod: "custom" };
+  }
+
+  // Preset period
+  const period = (req.query.period as string) || "all";
+  const bounds = DOCAPP_PERIOD_BOUNDS[period] ?? null;
+  const df = (col: string) => bounds ? `AND ${col} >= ${bounds[0]} AND ${col} < ${bounds[1]}` : "";
+  const bookingDateFilter = bounds ? `AND r.date::date >= ${bounds[0]} AND r.date::date < ${bounds[1]}` : "";
+  return { df, bookingDateFilter, activePeriod: period };
+}
+
 // ── Funnel Analytics — live from doc-app RDS ──────────────────────────────────
 app.get("/funnel-analytics", async (req, res) => {
   const docUrl = process.env.DOCAPP_DATABASE_URL;
   if (!docUrl) { res.status(500).json({ error: "DOCAPP_DATABASE_URL not set" }); return; }
 
-  // period query param controls date range for ALL queries
-  // Valid values: all | this_week | last_week | last_30d | last_90d
-  const period = (req.query.period as string) || "all";
-  type PeriodBounds = [string, string]; // [gte, lt)
-  const PERIOD_BOUNDS: Record<string, PeriodBounds | null> = {
-    all:       null,
-    this_week: ["DATE_TRUNC('week', CURRENT_DATE)",                      "DATE_TRUNC('week', CURRENT_DATE) + INTERVAL '7 days'"],
-    last_week: ["DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'", "DATE_TRUNC('week', CURRENT_DATE)"],
-    last_30d:  ["CURRENT_DATE - INTERVAL '29 days'",                     "CURRENT_DATE + INTERVAL '1 day'"],
-    last_90d:  ["CURRENT_DATE - INTERVAL '89 days'",                     "CURRENT_DATE + INTERVAL '1 day'"],
-  };
-  // df(col) → "AND col >= X AND col < Y" for the active period, empty when all
-  const df = (col: string): string => {
-    const b = PERIOD_BOUNDS[period];
-    return b ? `AND ${col} >= ${b[0]} AND ${col} < ${b[1]}` : "";
-  };
-  const bookingDateFilter = (() => {
-    const b = PERIOD_BOUNDS[period];
-    return b ? `AND r.date::date >= ${b[0]} AND r.date::date < ${b[1]}` : "";
-  })();
+  const { df, bookingDateFilter, activePeriod } = buildDocAppPeriodFilter(req);
 
   const sql = postgres(docUrl, { ssl: "require", max: 3 });
   try {
@@ -794,19 +988,19 @@ app.get("/funnel-analytics", async (req, res) => {
     ]);
 
     res.json({
-      pipeline:          pipeline[0],
-      consultOutcomes:   consultOutcomes,
-      tpOutcomes:        tpOutcomes,
-      appStatus:         appStatus,
-      topSymptoms:       topSymptoms,
-      noShowSymptoms:    noShowSymptoms,
-      ageGroups:         ageGroups,
-      genders:           genders,
-      states:            states,
+      pipeline: pipeline[0],
+      consultOutcomes: consultOutcomes,
+      tpOutcomes: tpOutcomes,
+      appStatus: appStatus,
+      topSymptoms: topSymptoms,
+      noShowSymptoms: noShowSymptoms,
+      ageGroups: ageGroups,
+      genders: genders,
+      states: states,
       bookingSourceStats: bookingSourceStats,
-      adminBookers:      adminBookers,
-      period:            period,
-      fetchedAt:         new Date(),
+      adminBookers: adminBookers,
+      period: activePeriod,
+      fetchedAt: new Date(),
     });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -816,16 +1010,81 @@ app.get("/funnel-analytics", async (req, res) => {
   }
 });
 
-// ── GET /questionnaire-analytics ──────────────────────────────────────────────
-app.get("/questionnaire-analytics", async (_req, res) => {
+// ── GET /funnel-drop-waterfall ────────────────────────────────────────────────
+// Returns stage-by-stage conversion counts and rates for the lastCompletedForm
+// waterfall: registered → questionnaire → discharge → fees → treatmentplan.
+// Also returns consent-signed count and consent→no-booking dark zone count.
+app.get("/funnel-drop-waterfall", async (req, res) => {
   const docUrl = process.env.DOCAPP_DATABASE_URL;
   if (!docUrl) { res.status(500).json({ error: "DOCAPP_DATABASE_URL not set" }); return; }
 
+  const { df } = buildDocAppPeriodFilter(req);
+  const docSql = postgres(docUrl, { ssl: "require", max: 3 });
+  try {
+    const [waterfall, consentGap] = await Promise.all([
+      docSql.unsafe(`
+        SELECT
+          COUNT(*)::int                                                                                                         AS registered,
+          COUNT(*) FILTER (WHERE "lastCompletedForm" IN ('questionnaire','discharge','fees','treatmentplan'))::int             AS reached_questionnaire,
+          COUNT(*) FILTER (WHERE "lastCompletedForm" IN ('discharge','fees','treatmentplan'))::int                             AS reached_discharge,
+          COUNT(*) FILTER (WHERE "lastCompletedForm" IN ('fees','treatmentplan'))::int                                         AS reached_fees,
+          COUNT(*) FILTER (WHERE "lastCompletedForm" = 'treatmentplan')::int                                                   AS reached_treatmentplan
+        FROM patient
+        WHERE LOWER(COALESCE("fullName",'')) NOT LIKE '%test%'
+          AND LOWER(COALESCE(email,''))      NOT LIKE '%test%'
+          AND LOWER(COALESCE("fullName",'')) NOT LIKE '%zelda%'
+          AND LOWER(COALESCE(email,''))      NOT LIKE '%zelda%'
+          ${df('"createdAt"')}
+      `),
+      // Patients who signed consent but never booked a slot
+      docSql.unsafe(`
+        SELECT COUNT(DISTINCT cs.patient_id)::int AS consent_no_booking
+        FROM consentsubmission cs
+        JOIN patient p ON p.id = cs.patient_id
+        LEFT JOIN patientslot ps ON ps.patient_id = p."zohoID"
+        WHERE LOWER(COALESCE(p."fullName",'')) NOT LIKE '%test%'
+          AND LOWER(COALESCE(p.email,''))      NOT LIKE '%test%'
+          AND ps.patient_id IS NULL
+          ${df('p."createdAt"')}
+      `),
+    ]);
+
+    const w = waterfall[0] as unknown as {
+      registered: number; reached_questionnaire: number; reached_discharge: number;
+      reached_fees: number; reached_treatmentplan: number;
+    };
+    const rate = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
+
+    res.json({
+      stages: [
+        { stage: "registered", label: "Registered", count: w.registered, pct_of_registered: 100, pct_of_prev: 100 },
+        { stage: "questionnaire", label: "Questionnaire complete", count: w.reached_questionnaire, pct_of_registered: rate(w.reached_questionnaire, w.registered), pct_of_prev: rate(w.reached_questionnaire, w.registered) },
+        { stage: "discharge", label: "Discharge letter", count: w.reached_discharge, pct_of_registered: rate(w.reached_discharge, w.registered), pct_of_prev: rate(w.reached_discharge, w.reached_questionnaire) },
+        { stage: "fees", label: "Consultation fee paid", count: w.reached_fees, pct_of_registered: rate(w.reached_fees, w.registered), pct_of_prev: rate(w.reached_fees, w.reached_discharge) },
+        { stage: "treatmentplan", label: "Treatment plan", count: w.reached_treatmentplan, pct_of_registered: rate(w.reached_treatmentplan, w.registered), pct_of_prev: rate(w.reached_treatmentplan, w.reached_fees) },
+      ],
+      consent_no_booking: (consentGap[0] as unknown as { consent_no_booking: number })?.consent_no_booking ?? 0,
+      fetchedAt: new Date(),
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    res.status(500).json({ error: msg });
+  } finally {
+    await docSql.end();
+  }
+});
+
+// ── GET /questionnaire-analytics ──────────────────────────────────────────────
+app.get("/questionnaire-analytics", async (req, res) => {
+  const docUrl = process.env.DOCAPP_DATABASE_URL;
+  if (!docUrl) { res.status(500).json({ error: "DOCAPP_DATABASE_URL not set" }); return; }
+
+  const { df } = buildDocAppPeriodFilter(req);
   const sql = postgres(docUrl, { ssl: "require", max: 3 });
   try {
     const [regToCompletion, stepDropoff, stepReach, lastCompletedForm, timingBuckets] = await Promise.all([
       // ── 1. Registration → questionnaire completion timing ──────────────
-      sql`
+      sql.unsafe(`
         SELECT
           ROUND(AVG(EXTRACT(EPOCH FROM (q_max - "createdAt"))/3600)::numeric, 1)                                             AS avg_hours,
           ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (q_max - "createdAt"))/3600)::numeric, 2)    AS median_hours,
@@ -839,13 +1098,14 @@ app.get("/questionnaire-analytics", async (_req, res) => {
             AND LOWER(COALESCE(p.email, ''))      NOT LIKE '%test%'
             AND LOWER(COALESCE(p."fullName", '')) NOT LIKE '%zelda%'
             AND LOWER(COALESCE(p.email, ''))      NOT LIKE '%zelda%'
+            ${df('p."createdAt"')}
           GROUP BY p."patientID", p."createdAt"
           HAVING MAX(q."updatedAt") > p."createdAt"
             AND EXTRACT(EPOCH FROM (MAX(q."updatedAt") - p."createdAt"))/3600 BETWEEN 0 AND 720
         ) t
-      `,
+      `),
       // ── 2. Where users stopped (last step per session) ────────────────
-      sql`
+      sql.unsafe(`
         SELECT last_step, COUNT(*)::int AS sessions
         FROM (
           SELECT session_id, MAX(step) AS last_step
@@ -858,14 +1118,15 @@ app.get("/questionnaire-analytics", async (_req, res) => {
                  OR LOWER(COALESCE("fullName", '')) LIKE '%zelda%'
                  OR LOWER(COALESCE(email, ''))      LIKE '%zelda%'
             )
+            AND user_id IN (SELECT "patientID" FROM patient WHERE 1=1 ${df('"createdAt"')})
           GROUP BY session_id
         ) t
         WHERE last_step BETWEEN 1 AND 12
         GROUP BY last_step
         ORDER BY last_step
-      `,
+      `),
       // ── 3. Unique users who reached each step ─────────────────────────
-      sql`
+      sql.unsafe(`
         SELECT step, COUNT(DISTINCT user_id)::int AS users
         FROM questionnaire_events
         WHERE user_id IS NOT NULL AND user_id != ''
@@ -877,22 +1138,24 @@ app.get("/questionnaire-analytics", async (_req, res) => {
                OR LOWER(COALESCE("fullName", '')) LIKE '%zelda%'
                OR LOWER(COALESCE(email, ''))      LIKE '%zelda%'
           )
+          AND user_id IN (SELECT "patientID" FROM patient WHERE 1=1 ${df('"createdAt"')})
         GROUP BY step
         ORDER BY step
-      `,
+      `),
       // ── 4. Patient journey stage (lastCompletedForm) ──────────────────
-      sql`
+      sql.unsafe(`
         SELECT COALESCE("lastCompletedForm", 'none') AS stage, COUNT(*)::int AS cnt
         FROM patient
         WHERE LOWER(COALESCE("fullName", '')) NOT LIKE '%test%'
           AND LOWER(COALESCE(email, ''))      NOT LIKE '%test%'
           AND LOWER(COALESCE("fullName", '')) NOT LIKE '%zelda%'
           AND LOWER(COALESCE(email, ''))      NOT LIKE '%zelda%'
+          ${df('"createdAt"')}
         GROUP BY "lastCompletedForm"
         ORDER BY cnt DESC
-      `,
+      `),
       // ── 5. Timing distribution buckets ────────────────────────────────
-      sql`
+      sql.unsafe(`
         WITH timing AS (
           SELECT EXTRACT(EPOCH FROM (MAX(q."updatedAt") - p."createdAt"))/3600 AS h
           FROM patient p
@@ -902,6 +1165,7 @@ app.get("/questionnaire-analytics", async (_req, res) => {
             AND LOWER(COALESCE(p.email, ''))      NOT LIKE '%test%'
             AND LOWER(COALESCE(p."fullName", '')) NOT LIKE '%zelda%'
             AND LOWER(COALESCE(p.email, ''))      NOT LIKE '%zelda%'
+            ${df('p."createdAt"')}
           GROUP BY p."patientID", p."createdAt"
           HAVING MAX(q."updatedAt") > p."createdAt"
             AND EXTRACT(EPOCH FROM (MAX(q."updatedAt") - p."createdAt"))/3600 BETWEEN 0 AND 720
@@ -913,7 +1177,7 @@ app.get("/questionnaire-analytics", async (_req, res) => {
           COUNT(CASE WHEN h BETWEEN 2 AND 24  THEN 1 END)::int               AS h2_to_24h,
           COUNT(CASE WHEN h > 24              THEN 1 END)::int               AS over_24h
         FROM timing
-      `,
+      `),
     ]);
 
     // Step labels map
@@ -933,23 +1197,23 @@ app.get("/questionnaire-analytics", async (_req, res) => {
     };
 
     const dropoffWithLabels = (stepDropoff as any[]).map((r) => ({
-      step:     r.last_step,
-      label:    STEP_LABELS[r.last_step] ?? `Step ${r.last_step}`,
+      step: r.last_step,
+      label: STEP_LABELS[r.last_step] ?? `Step ${r.last_step}`,
       sessions: r.sessions,
     }));
     const reachWithLabels = (stepReach as any[]).map((r) => ({
-      step:  r.step,
+      step: r.step,
       label: STEP_LABELS[r.step] ?? `Step ${r.step}`,
       users: r.users,
     }));
 
     res.json({
-      regToCompletion:   regToCompletion[0],
-      timingBuckets:     timingBuckets[0],
-      stepDropoff:       dropoffWithLabels,
-      stepReach:         reachWithLabels,
+      regToCompletion: regToCompletion[0],
+      timingBuckets: timingBuckets[0],
+      stepDropoff: dropoffWithLabels,
+      stepReach: reachWithLabels,
       lastCompletedForm: lastCompletedForm,
-      fetchedAt:         new Date(),
+      fetchedAt: new Date(),
     });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -967,12 +1231,12 @@ app.post("/ai-conversion-insights", async (req, res) => {
   if (!openAiKey) { res.status(500).json({ error: "OPEN_AI_KEY not set" }); return; }
 
   const ctx = req.body as {
-    pipeline:          Record<string, number>;
+    pipeline: Record<string, number>;
     bookingSourceStats: { source: string; total_booked: number; showed_up: number; no_show: number }[];
-    regToCompletion:   { avg_hours: number; median_hours: number; patients: number };
-    timingBuckets:     { total: number; within_30min: number; h1_to_2h: number; h2_to_24h: number; over_24h: number };
-    stepDropoff:       { step: number; label: string; sessions: number }[];
-    stepReach:         { step: number; label: string; users: number }[];
+    regToCompletion: { avg_hours: number; median_hours: number; patients: number };
+    timingBuckets: { total: number; within_30min: number; h1_to_2h: number; h2_to_24h: number; over_24h: number };
+    stepDropoff: { step: number; label: string; sessions: number }[];
+    stepReach: { step: number; label: string; users: number }[];
     lastCompletedForm: { stage: string; cnt: number }[];
   };
 
@@ -981,12 +1245,12 @@ app.post("/ai-conversion-insights", async (req, res) => {
     return;
   }
 
-  const totalPatients  = ctx.lastCompletedForm?.reduce((s, r) => s + r.cnt, 0) ?? 0;
-  const stuckCount     = (ctx.lastCompletedForm?.find((r) => r.stage === "registration")?.cnt ?? 0)
-                       + (ctx.lastCompletedForm?.find((r) => r.stage === "none")?.cnt ?? 0);
-  const bookingCount   = ctx.lastCompletedForm?.find((r) => r.stage === "booking")?.cnt ?? 0;
-  const adminRow       = ctx.bookingSourceStats?.find((r) => r.source === "admin");
-  const patientRow     = ctx.bookingSourceStats?.find((r) => r.source === "patient");
+  const totalPatients = ctx.lastCompletedForm?.reduce((s, r) => s + r.cnt, 0) ?? 0;
+  const stuckCount = (ctx.lastCompletedForm?.find((r) => r.stage === "registration")?.cnt ?? 0)
+    + (ctx.lastCompletedForm?.find((r) => r.stage === "none")?.cnt ?? 0);
+  const bookingCount = ctx.lastCompletedForm?.find((r) => r.stage === "booking")?.cnt ?? 0;
+  const adminRow = ctx.bookingSourceStats?.find((r) => r.source === "admin");
+  const patientRow = ctx.bookingSourceStats?.find((r) => r.source === "patient");
 
   const systemPrompt = `You are a senior growth analyst for a telehealth platform selling medicinal cannabis.
 Your job is to identify the highest-leverage conversion improvements in the patient funnel.
@@ -1057,7 +1321,7 @@ What are the highest-priority actions to improve conversion?`;
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user",   content: userPrompt },
+          { role: "user", content: userPrompt },
         ],
       }),
     });
@@ -1269,8 +1533,9 @@ app.listen(PORT, () => {
   console.log(`  GET  /health-detail  → customer-index proxy`);
   console.log(`  GET  /shop-analytics → customer-index proxy`);
   console.log(`  GET  /all-patients           → analytics DB (all 25k+)`);
-  console.log(`  GET  /funnel-analytics        → doc-app RDS (live)`);
-  console.log(`  GET  /questionnaire-analytics → doc-app RDS (live)`);
+  console.log(`  GET  /funnel-analytics        → doc-app RDS (live) · ?period= or ?from=&to=`);
+  console.log(`  GET  /funnel-drop-waterfall   → doc-app RDS (live) · ?period= or ?from=&to=`);
+  console.log(`  GET  /questionnaire-analytics → doc-app RDS (live) · ?period= or ?from=&to=`);
   console.log(`  GET  /zoho-health             → Zoho CRM contacts + deals`);
   console.log(`  POST /ai-conversion-insights  → OpenAI GPT-4o-mini`);
 });

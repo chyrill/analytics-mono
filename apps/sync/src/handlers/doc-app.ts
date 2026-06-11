@@ -1,7 +1,8 @@
 import type { ScheduledHandler } from "aws-lambda";
-import { db, customers, reconciliationLog, supplyTracking, cartSessions, ordersDispatched } from "@analytics/db";
-import { sql } from "drizzle-orm";
+import { db, customers, reconciliationLog, supplyTracking, cartSessions, ordersDispatched, dbPatients, dbTreatmentPlans, syncCheckpoints, syncJobs } from "@analytics/db";
+import { sql, eq, and } from "drizzle-orm";
 import postgres from "postgres";
+import type { Sql } from "postgres";
 
 interface DocAppPatient {
   id: string;
@@ -296,6 +297,447 @@ export const handler: ScheduledHandler = async (_event) => {
 };
 
 if (require.main === module) {
-  void handler({} as never, {} as never, () => {});
+  void handler({} as never, {} as never, () => { });
+}
+
+// ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+async function getCheckpoint(source: string, entity: string): Promise<Date | null> {
+  const rows = await db.select().from(syncCheckpoints)
+    .where(and(eq(syncCheckpoints.source, source), eq(syncCheckpoints.entity, entity)))
+    .limit(1);
+  return rows[0]?.lastSyncedAt ?? null;
+}
+
+async function writeCheckpoint(source: string, entity: string, jobId: string, syncedAt: Date) {
+  await db.insert(syncCheckpoints)
+    .values({ source, entity, lastSyncedAt: syncedAt, lastJobId: jobId })
+    .onConflictDoUpdate({
+      target: [syncCheckpoints.source, syncCheckpoints.entity],
+      set: { lastSyncedAt: syncedAt, lastJobId: jobId },
+    });
+}
+
+// ── DocApp-specific row types ─────────────────────────────────────────────────
+
+interface DocAppPatientFull {
+  id: string;
+  email: string;
+  full_name: string | null;
+  patient_id: string | null;
+  zoho_id: string | null;
+  contact_id: string | null;
+  zoho_customer_id: string | null;
+  saleor_id: string | null;
+  returning_patient: boolean | null;
+  locked: boolean | null;
+  dr_locked: string | null;
+  state: string | null;
+  application_status: string | null;
+  last_completed_form: string | null;
+  dob: string | null;
+  used_cannabis_before: boolean | null;
+  mobile: string | null;
+  phone_verified: boolean | null;
+  consent_form_completed: boolean | null;
+  risk_rating: number | null;
+  created_at: Date | null;
+  updated_at: Date | null;
+}
+
+interface DocAppTreatmentPlan {
+  id: string;
+  email: string | null;
+  patient_id: string | null;
+  dr_id: string | null;
+  dr_name: string | null;
+  consultation_id: string | null;
+  outcome: string | null;
+  dr_notes: string | null;
+  date: string | null;
+  type: string | null;
+  mental_health_doc: string | null;
+  dose_per_day_22: string | null;
+  strength_concentration_22: string | null;
+  max_dose_22: string | null;
+  total_quantity_22: string | null;
+  number_of_repeat_22: number | null;
+  supply_interval_22: number | null;
+  dose_per_day_26: string | null;
+  strength_concentration_26: string | null;
+  max_dose_26: string | null;
+  total_quantity_26: string | null;
+  number_of_repeat_26: number | null;
+  supply_interval_26: number | null;
+  dose_per_day_29: string | null;
+  strength_concentration_29: string | null;
+  max_dose_29: string | null;
+  total_quantity_29: string | null;
+  number_of_repeat_29: number | null;
+  supply_interval_29: number | null;
+  id_verified: string | null;
+  source: string | null;
+  diagnosis: string | null;
+  last_notes_edited_at: Date | null;
+  last_notes_edited_by: string | null;
+  created_at: Date | null;
+  updated_at: Date | null;
+}
+
+// ── syncDocPatients ───────────────────────────────────────────────────────────
+
+async function syncDocPatients(
+  conn: Sql,
+  jobId: string,
+): Promise<{ fetched: number; upserted: number }> {
+  const since = await getCheckpoint("docapp", "patients");
+  const syncedAt = new Date();
+
+  let rows: DocAppPatientFull[];
+  if (since) {
+    console.log(`[docapp-sync] patients: incremental since ${since.toISOString()}`);
+    rows = await conn<DocAppPatientFull[]>`
+      SELECT
+        id::text,
+        lower(btrim(email))           AS email,
+        "fullName"                    AS full_name,
+        "patientID"                   AS patient_id,
+        "zohoID"                      AS zoho_id,
+        "contactId"                   AS contact_id,
+        "zohoCustomerId"              AS zoho_customer_id,
+        "saleorId"                    AS saleor_id,
+        "returningPatient"            AS returning_patient,
+        locked,
+        "drLocked"                    AS dr_locked,
+        state,
+        "applicationStatus"           AS application_status,
+        "lastCompletedForm"           AS last_completed_form,
+        dob,
+        "usedCannabisBefore"          AS used_cannabis_before,
+        mobile,
+        "phoneVerified"               AS phone_verified,
+        consent_form_completed,
+        "riskRating"                  AS risk_rating,
+        "createdAt"                   AS created_at,
+        "updatedAt"                   AS updated_at
+      FROM patient
+      WHERE email IS NOT NULL
+        AND btrim(email) != ''
+        AND "updatedAt" > ${since}
+    `;
+  } else {
+    console.log("[docapp-sync] patients: full scan");
+    rows = await conn<DocAppPatientFull[]>`
+      SELECT
+        id::text,
+        lower(btrim(email))           AS email,
+        "fullName"                    AS full_name,
+        "patientID"                   AS patient_id,
+        "zohoID"                      AS zoho_id,
+        "contactId"                   AS contact_id,
+        "zohoCustomerId"              AS zoho_customer_id,
+        "saleorId"                    AS saleor_id,
+        "returningPatient"            AS returning_patient,
+        locked,
+        "drLocked"                    AS dr_locked,
+        state,
+        "applicationStatus"           AS application_status,
+        "lastCompletedForm"           AS last_completed_form,
+        dob,
+        "usedCannabisBefore"          AS used_cannabis_before,
+        mobile,
+        "phoneVerified"               AS phone_verified,
+        consent_form_completed,
+        "riskRating"                  AS risk_rating,
+        "createdAt"                   AS created_at,
+        "updatedAt"                   AS updated_at
+      FROM patient
+      WHERE email IS NOT NULL
+        AND btrim(email) != ''
+    `;
+  }
+
+  console.log(`[docapp-sync] fetched ${rows.length} patients`);
+  if (rows.length === 0) {
+    await writeCheckpoint("docapp", "patients", jobId, syncedAt);
+    return { fetched: 0, upserted: 0 };
+  }
+
+  let upserted = 0;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    await db.insert(dbPatients)
+      .values(batch.map((r) => ({
+        sourceId: r.id,
+        email: r.email,
+        fullName: r.full_name,
+        patientId: r.patient_id,
+        zohoId: r.zoho_id,
+        contactId: r.contact_id,
+        zohoCustomerId: r.zoho_customer_id,
+        saleorId: r.saleor_id,
+        returningPatient: r.returning_patient,
+        locked: r.locked,
+        drLocked: r.dr_locked,
+        state: r.state,
+        applicationStatus: r.application_status,
+        lastCompletedForm: r.last_completed_form,
+        dob: r.dob,
+        usedCannabisBefore: r.used_cannabis_before,
+        mobile: r.mobile,
+        phoneVerified: r.phone_verified,
+        consentFormCompleted: r.consent_form_completed,
+        riskRating: r.risk_rating,
+        sourceCreatedAt: r.created_at,
+        sourceUpdatedAt: r.updated_at,
+      })))
+      .onConflictDoUpdate({
+        target: dbPatients.sourceId,
+        set: {
+          email: sql`excluded.email`,
+          fullName: sql`excluded.full_name`,
+          patientId: sql`excluded.patient_id`,
+          zohoId: sql`excluded.zoho_id`,
+          contactId: sql`excluded.contact_id`,
+          zohoCustomerId: sql`excluded.zoho_customer_id`,
+          saleorId: sql`excluded.saleor_id`,
+          returningPatient: sql`excluded.returning_patient`,
+          locked: sql`excluded.locked`,
+          drLocked: sql`excluded.dr_locked`,
+          state: sql`excluded.state`,
+          applicationStatus: sql`excluded.application_status`,
+          lastCompletedForm: sql`excluded.last_completed_form`,
+          dob: sql`excluded.dob`,
+          usedCannabisBefore: sql`excluded.used_cannabis_before`,
+          mobile: sql`excluded.mobile`,
+          phoneVerified: sql`excluded.phone_verified`,
+          consentFormCompleted: sql`excluded.consent_form_completed`,
+          riskRating: sql`excluded.risk_rating`,
+          sourceUpdatedAt: sql`excluded.source_updated_at`,
+          syncedAt: sql`now()`,
+        },
+      });
+    upserted += batch.length;
+  }
+
+  await writeCheckpoint("docapp", "patients", jobId, syncedAt);
+  console.log(`[docapp-sync] db_patients upserted: ${upserted}`);
+  return { fetched: rows.length, upserted };
+}
+
+// ── syncDocTreatmentPlans ─────────────────────────────────────────────────────
+
+async function syncDocTreatmentPlans(
+  conn: Sql,
+  jobId: string,
+): Promise<{ fetched: number; upserted: number }> {
+  const since = await getCheckpoint("docapp", "treatment_plans");
+  const syncedAt = new Date();
+
+  let rows: DocAppTreatmentPlan[];
+  if (since) {
+    console.log(`[docapp-sync] treatment_plans: incremental since ${since.toISOString()}`);
+    rows = await conn<DocAppTreatmentPlan[]>`
+      SELECT
+        id::text,
+        lower(btrim(email))               AS email,
+        "patientID"                        AS patient_id,
+        "drId"                             AS dr_id,
+        "drName"                           AS dr_name,
+        "consultationId"::text             AS consultation_id,
+        outcome,
+        "drNotes"                          AS dr_notes,
+        date::text,
+        type,
+        "mentalHealthSupprtingDocument"    AS mental_health_doc,
+        "dosePerDay22"::text               AS dose_per_day_22,
+        "strengthAndConcentration22"       AS strength_concentration_22,
+        "maxDose22"::text                  AS max_dose_22,
+        "totalQuantity22"::text            AS total_quantity_22,
+        "numberOfRepeat22"                 AS number_of_repeat_22,
+        "supplyInterval22"                 AS supply_interval_22,
+        "dosePerDay26"::text               AS dose_per_day_26,
+        "strengthAndConcentration26"       AS strength_concentration_26,
+        "maxDose26"::text                  AS max_dose_26,
+        "totalQuantity26"::text            AS total_quantity_26,
+        "numberOfRepeat26"                 AS number_of_repeat_26,
+        "supplyInterval26"                 AS supply_interval_26,
+        "dosePerDay29"::text               AS dose_per_day_29,
+        "strengthAndConcentration29"       AS strength_concentration_29,
+        "maxDose29"::text                  AS max_dose_29,
+        "totalQuantity29"::text            AS total_quantity_29,
+        "numberOfRepeat29"                 AS number_of_repeat_29,
+        "supplyInterval29"                 AS supply_interval_29,
+        "idVerified"                       AS id_verified,
+        source,
+        diagnosis,
+        "lastNotesEditedAt"                AS last_notes_edited_at,
+        "lastNotesEditedBy"                AS last_notes_edited_by,
+        "createdAt"                        AS created_at,
+        "updatedAt"                        AS updated_at
+      FROM treatmentplan
+      WHERE email IS NOT NULL
+        AND btrim(email) != ''
+        AND ("updatedAt" > ${since} OR "createdAt" > ${since})
+    `;
+  } else {
+    console.log("[docapp-sync] treatment_plans: full scan");
+    rows = await conn<DocAppTreatmentPlan[]>`
+      SELECT
+        id::text,
+        lower(btrim(email))               AS email,
+        "patientID"                        AS patient_id,
+        "drId"                             AS dr_id,
+        "drName"                           AS dr_name,
+        "consultationId"::text             AS consultation_id,
+        outcome,
+        "drNotes"                          AS dr_notes,
+        date::text,
+        type,
+        "mentalHealthSupprtingDocument"    AS mental_health_doc,
+        "dosePerDay22"::text               AS dose_per_day_22,
+        "strengthAndConcentration22"       AS strength_concentration_22,
+        "maxDose22"::text                  AS max_dose_22,
+        "totalQuantity22"::text            AS total_quantity_22,
+        "numberOfRepeat22"                 AS number_of_repeat_22,
+        "supplyInterval22"                 AS supply_interval_22,
+        "dosePerDay26"::text               AS dose_per_day_26,
+        "strengthAndConcentration26"       AS strength_concentration_26,
+        "maxDose26"::text                  AS max_dose_26,
+        "totalQuantity26"::text            AS total_quantity_26,
+        "numberOfRepeat26"                 AS number_of_repeat_26,
+        "supplyInterval26"                 AS supply_interval_26,
+        "dosePerDay29"::text               AS dose_per_day_29,
+        "strengthAndConcentration29"       AS strength_concentration_29,
+        "maxDose29"::text                  AS max_dose_29,
+        "totalQuantity29"::text            AS total_quantity_29,
+        "numberOfRepeat29"                 AS number_of_repeat_29,
+        "supplyInterval29"                 AS supply_interval_29,
+        "idVerified"                       AS id_verified,
+        source,
+        diagnosis,
+        "lastNotesEditedAt"                AS last_notes_edited_at,
+        "lastNotesEditedBy"                AS last_notes_edited_by,
+        "createdAt"                        AS created_at,
+        "updatedAt"                        AS updated_at
+      FROM treatmentplan
+      WHERE email IS NOT NULL
+        AND btrim(email) != ''
+    `;
+  }
+
+  console.log(`[docapp-sync] fetched ${rows.length} treatment plans`);
+  if (rows.length === 0) {
+    await writeCheckpoint("docapp", "treatment_plans", jobId, syncedAt);
+    return { fetched: 0, upserted: 0 };
+  }
+
+  let upserted = 0;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    await db.insert(dbTreatmentPlans)
+      .values(batch.map((r) => ({
+        sourceId: r.id,
+        email: r.email ?? "",
+        patientId: r.patient_id,
+        drId: r.dr_id,
+        drName: r.dr_name,
+        consultationId: r.consultation_id,
+        outcome: r.outcome,
+        drNotes: r.dr_notes,
+        date: r.date,
+        type: r.type,
+        mentalHealthDocument: r.mental_health_doc,
+        dosePerDay22: r.dose_per_day_22,
+        strengthConcentration22: r.strength_concentration_22,
+        maxDose22: r.max_dose_22,
+        totalQuantity22: r.total_quantity_22,
+        numberOfRepeat22: r.number_of_repeat_22,
+        supplyInterval22: r.supply_interval_22,
+        dosePerDay26: r.dose_per_day_26,
+        strengthConcentration26: r.strength_concentration_26,
+        maxDose26: r.max_dose_26,
+        totalQuantity26: r.total_quantity_26,
+        numberOfRepeat26: r.number_of_repeat_26,
+        supplyInterval26: r.supply_interval_26,
+        dosePerDay29: r.dose_per_day_29,
+        strengthConcentration29: r.strength_concentration_29,
+        maxDose29: r.max_dose_29,
+        totalQuantity29: r.total_quantity_29,
+        numberOfRepeat29: r.number_of_repeat_29,
+        supplyInterval29: r.supply_interval_29,
+        idVerified: r.id_verified,
+        source: r.source,
+        diagnosis: r.diagnosis,
+        lastNotesEditedAt: r.last_notes_edited_at,
+        lastNotesEditedBy: r.last_notes_edited_by,
+        sourceCreatedAt: r.created_at,
+        sourceUpdatedAt: r.updated_at,
+      })))
+      .onConflictDoUpdate({
+        target: dbTreatmentPlans.sourceId,
+        set: {
+          outcome: sql`excluded.outcome`,
+          drNotes: sql`excluded.dr_notes`,
+          dosePerDay22: sql`excluded.dose_per_day_22`,
+          strengthConcentration22: sql`excluded.strength_concentration_22`,
+          maxDose22: sql`excluded.max_dose_22`,
+          totalQuantity22: sql`excluded.total_quantity_22`,
+          numberOfRepeat22: sql`excluded.number_of_repeat_22`,
+          supplyInterval22: sql`excluded.supply_interval_22`,
+          dosePerDay26: sql`excluded.dose_per_day_26`,
+          strengthConcentration26: sql`excluded.strength_concentration_26`,
+          maxDose26: sql`excluded.max_dose_26`,
+          totalQuantity26: sql`excluded.total_quantity_26`,
+          numberOfRepeat26: sql`excluded.number_of_repeat_26`,
+          supplyInterval26: sql`excluded.supply_interval_26`,
+          dosePerDay29: sql`excluded.dose_per_day_29`,
+          strengthConcentration29: sql`excluded.strength_concentration_29`,
+          maxDose29: sql`excluded.max_dose_29`,
+          totalQuantity29: sql`excluded.total_quantity_29`,
+          numberOfRepeat29: sql`excluded.number_of_repeat_29`,
+          supplyInterval29: sql`excluded.supply_interval_29`,
+          idVerified: sql`excluded.id_verified`,
+          source: sql`excluded.source`,
+          diagnosis: sql`excluded.diagnosis`,
+          lastNotesEditedAt: sql`excluded.last_notes_edited_at`,
+          lastNotesEditedBy: sql`excluded.last_notes_edited_by`,
+          sourceUpdatedAt: sql`excluded.source_updated_at`,
+          syncedAt: sql`now()`,
+        },
+      });
+    upserted += batch.length;
+  }
+
+  await writeCheckpoint("docapp", "treatment_plans", jobId, syncedAt);
+  console.log(`[docapp-sync] db_treatment_plans upserted: ${upserted}`);
+  return { fetched: rows.length, upserted };
+}
+
+// ── runDocAppSync — entry point for /sync/docapp API route ───────────────────
+
+export async function runDocAppSync(jobId: string): Promise<{ fetched: number; upserted: number }> {
+  const conn = postgres(process.env.DOCAPP_DATABASE_URL ?? "", {
+    ssl: "require",
+    max: 5,
+  });
+  if (!process.env.DOCAPP_DATABASE_URL) throw new Error("DOCAPP_DATABASE_URL not set");
+
+  try {
+    let totalFetched = 0;
+    let totalUpserted = 0;
+
+    const p = await syncDocPatients(conn, jobId);
+    totalFetched += p.fetched;
+    totalUpserted += p.upserted;
+
+    const t = await syncDocTreatmentPlans(conn, jobId);
+    totalFetched += t.fetched;
+    totalUpserted += t.upserted;
+
+    return { fetched: totalFetched, upserted: totalUpserted };
+  } finally {
+    await conn.end();
+  }
 }
 
