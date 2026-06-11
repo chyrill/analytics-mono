@@ -33,6 +33,9 @@ interface QData {
   stepReach:         QStepRow[];
   lastCompletedForm: QStageRow[];
 }
+// ── Drop-off waterfall types ───────────────────────────────────────────────
+interface WaterfallStage { stage: string; label: string; count: number; pct_of_registered: number; pct_of_prev: number; }
+interface WaterfallData { stages: WaterfallStage[]; consent_no_booking: number; fetchedAt: string; }
 // ── AI insights types ────────────────────────────────────────────────────────
 interface AIRec {
   priority: number;
@@ -121,13 +124,14 @@ function tpGroup(outcome: string): { label: string; color: string } {
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
-type Period = "all" | "this_week" | "last_week" | "last_30d" | "last_90d";
+type Period = "all" | "this_week" | "last_week" | "last_30d" | "last_90d" | "custom";
 const PERIOD_LABELS: Record<Period, string> = {
   all:       "All time",
   this_week: "This week",
   last_week: "Last week",
   last_30d:  "Last 30 days",
   last_90d:  "Last 90 days",
+  custom:    "Custom range",
 };
 
 export default function FunnelAnalyticsPage() {
@@ -137,14 +141,25 @@ export default function FunnelAnalyticsPage() {
   const [qData, setQData]   = useState<QData | null>(null);
   const [qLoad, setQLoad]   = useState(true);
   const [qErr, setQErr]     = useState<string | null>(null);
-  const [aiData, setAiData]  = useState<AIInsights | null>(null);
-  const [aiLoad, setAiLoad]  = useState(false);
-  const [aiErr, setAiErr]    = useState<string | null>(null);
-  const [period, setPeriod]  = useState<Period>("all");
+  const [aiData, setAiData]        = useState<AIInsights | null>(null);
+  const [aiLoad, setAiLoad]        = useState(false);
+  const [aiErr, setAiErr]          = useState<string | null>(null);
+  const [period, setPeriod]        = useState<Period>("all");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo]     = useState("");
+  const [wData, setWData]          = useState<WaterfallData | null>(null);
+  const [wLoad, setWLoad]          = useState(true);
 
-  function load(p: Period = period) {
+  function buildQS(p: Period, from: string, to: string): string {
+    if (p === "custom" && from) {
+      return to ? `?from=${from}&to=${to}` : `?from=${from}`;
+    }
+    return p !== "all" ? `?period=${p}` : "";
+  }
+
+  function load(p: Period = period, from: string = customFrom, to: string = customTo) {
+    const qs = buildQS(p, from, to);
     setLoad(true); setError(null);
-    const qs = p !== "all" ? `?period=${p}` : "";
     fetch(`${API_BASE}/funnel-analytics${qs}`)
       .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<FunnelData>; })
       .then(setData)
@@ -152,14 +167,21 @@ export default function FunnelAnalyticsPage() {
       .finally(() => setLoad(false));
 
     setQLoad(true); setQErr(null);
-    fetch(`${API_BASE}/questionnaire-analytics`)
+    fetch(`${API_BASE}/questionnaire-analytics${qs}`)
       .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<QData>; })
       .then(setQData)
       .catch((e: Error) => setQErr(e.message))
       .finally(() => setQLoad(false));
+
+    setWLoad(true);
+    fetch(`${API_BASE}/funnel-drop-waterfall${qs}`)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<WaterfallData>; })
+      .then(setWData)
+      .catch(() => setWData(null))
+      .finally(() => setWLoad(false));
   }
 
-  useEffect(() => { load(period); }, [period]);
+  useEffect(() => { load(period, customFrom, customTo); }, [period]);
 
   // Normalised symptoms — merge near-duplicate labels
   const mergedSymptoms = useMemo(() => {
@@ -183,6 +205,17 @@ export default function FunnelAnalyticsPage() {
     }
     return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
   }, [data]);
+
+  // Step-to-step conversion rates derived from stepReach counts
+  const stepConversionRates = useMemo(() => {
+    if (!qData?.stepReach?.length) return [];
+    return qData.stepReach.map((row, i) => ({
+      ...row,
+      rate: i === 0 ? 100 : (qData.stepReach[i - 1].users ?? 0) > 0
+        ? Math.round(((row.users ?? 0) / (qData.stepReach[i - 1].users ?? 1)) * 100)
+        : 0,
+    }));
+  }, [qData]);
 
   const p = data?.pipeline;
   const maxSymptom  = mergedSymptoms[0]?.[1]  ?? 1;
@@ -230,13 +263,35 @@ export default function FunnelAnalyticsPage() {
           <Link href="/shop-analytics" style={navLink}>Shop Analytics →</Link>
           <Link href="/"               style={navLink}>Reconciliation →</Link>
           <div style={{ display: "flex", gap: 2, background: "#0d0d0d", borderRadius: 7, padding: 3, border: "1px solid #222" }}>
-            {(["all", "this_week", "last_week", "last_30d", "last_90d"] as const).map((p) => (
+            {(["all", "this_week", "last_week", "last_30d", "last_90d", "custom"] as const).map((p) => (
               <button key={p} onClick={() => setPeriod(p)} disabled={loading} style={{ background: period === p ? "#1a2e4a" : "transparent", color: period === p ? BLUE : "#666", border: "none", borderRadius: 5, padding: "4px 11px", fontSize: 11.5, fontWeight: period === p ? 600 : 400, cursor: "pointer", whiteSpace: "nowrap", transition: "all 0.15s" }}>
                 {PERIOD_LABELS[p]}
               </button>
             ))}
           </div>
-          <button onClick={() => load(period)} disabled={loading} style={ghostBtn}>⟳ Refresh</button>
+          {period === "custom" && (
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input
+                type="date"
+                value={customFrom}
+                onChange={(e) => setCustomFrom(e.target.value)}
+                style={{ background: "#111", border: "1px solid #2a2a2a", borderRadius: 5, color: "#bbb", fontSize: 11.5, padding: "4px 8px", cursor: "pointer" }}
+              />
+              <span style={{ color: "#444", fontSize: 11 }}>to</span>
+              <input
+                type="date"
+                value={customTo}
+                onChange={(e) => setCustomTo(e.target.value)}
+                style={{ background: "#111", border: "1px solid #2a2a2a", borderRadius: 5, color: "#bbb", fontSize: 11.5, padding: "4px 8px", cursor: "pointer" }}
+              />
+              <button
+                onClick={() => load("custom", customFrom, customTo)}
+                disabled={!customFrom || loading}
+                style={{ ...ghostBtn, opacity: !customFrom ? 0.4 : 1 }}
+              >Apply</button>
+            </div>
+          )}
+          <button onClick={() => load(period, customFrom, customTo)} disabled={loading} style={ghostBtn}>⟳ Refresh</button>
         </div>
       </header>
 
@@ -245,6 +300,37 @@ export default function FunnelAnalyticsPage() {
 
       {data && p && (
         <div style={{ padding: "28px 32px" }}>
+
+          {/* ── Section 0: Drop-Off Waterfall ── */}
+          {wData && (
+            <Section title="Funnel Drop-Off Waterfall">
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 1, background: "#1a1a1a", borderRadius: 8, overflow: "hidden", marginBottom: 16 }}>
+                {wData.stages.map((s, i) => (
+                  <div key={s.stage} style={{ background: "#0f0f0f", padding: "16px 18px" }}>
+                    <div style={{ fontSize: 10, color: "#444", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 4 }}>{s.label}</div>
+                    <div style={{ fontSize: 24, fontWeight: 700, color: i === 0 ? "#fff" : s.pct_of_prev >= 70 ? GREEN : s.pct_of_prev >= 40 ? AMBER : RED, letterSpacing: "-0.3px" }}>{fmt(s.count)}</div>
+                    <div style={{ fontSize: 11, color: "#555", marginTop: 3 }}>
+                      {i === 0 ? "baseline" : <><span style={{ color: s.pct_of_prev >= 70 ? GREEN : s.pct_of_prev >= 40 ? AMBER : RED, fontWeight: 600 }}>{s.pct_of_prev}%</span> of prev stage</>}
+                    </div>
+                    <div style={{ height: 3, background: "#1a1a1a", borderRadius: 2, marginTop: 8 }}>
+                      <div style={{ height: "100%", width: `${s.pct_of_registered}%`, background: i === 0 ? "#444" : s.pct_of_prev >= 70 ? GREEN : s.pct_of_prev >= 40 ? AMBER : RED, borderRadius: 2 }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {wData.consent_no_booking > 0 && (
+                <div style={{ background: "#1a0f00", border: "1px solid #3d2800", borderRadius: 8, padding: "14px 20px", display: "flex", alignItems: "center", gap: 16 }}>
+                  <div>
+                    <div style={{ fontSize: 10, color: "#664400", textTransform: "uppercase", letterSpacing: "0.5px" }}>Dark zone — consent signed, no booking</div>
+                    <div style={{ fontSize: 22, fontWeight: 700, color: AMBER, marginTop: 2 }}>{fmt(wData.consent_no_booking)}</div>
+                  </div>
+                  <div style={{ fontSize: 12, color: "#664400", lineHeight: 1.6 }}>
+                    Patients who completed the consent form but never booked a slot. These are high-intent patients who stopped between Step 13 and Step 14 — a direct intervention target.
+                  </div>
+                </div>
+              )}
+            </Section>
+          )}
 
           {/* ── Section 1: Funnel Pipeline ── */}
           <Section title="Registration Funnel">
@@ -688,6 +774,11 @@ export default function FunnelAnalyticsPage() {
 
                 {/* ── Section 9: Step Drop-off ── */}
                 <Section title="Questionnaire — Step Drop-off">
+                  {period !== "all" && (
+                    <div style={{ fontSize: 11, color: BLUE, marginBottom: 12 }}>
+                      Period: {period === "custom" ? `${customFrom}${customTo ? ` → ${customTo}` : ""}` : PERIOD_LABELS[period]}
+                    </div>
+                  )}
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
                     <div style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: 8, padding: "20px 24px" }}>
                       <div style={{ fontSize: 12, color: "#555", marginBottom: 4 }}>Where patients stopped (steps 1–8)</div>
@@ -713,6 +804,21 @@ export default function FunnelAnalyticsPage() {
                       ))}
                     </div>
                   </div>
+                  {/* Step-to-step conversion rates */}
+                  {stepConversionRates.length > 0 && (
+                    <div style={{ marginTop: 16, background: "#111", border: "1px solid #1e1e1e", borderRadius: 8, padding: "20px 24px" }}>
+                      <div style={{ fontSize: 12, color: "#555", marginBottom: 16 }}>Step-to-step conversion rate (% of users who reached the next step)</div>
+                      <div style={{ display: "flex", gap: 0, overflowX: "auto" }}>
+                        {stepConversionRates.map((r, i) => (
+                          <div key={r.step} style={{ flex: "0 0 auto", minWidth: 100, padding: "12px 14px", borderRight: i < stepConversionRates.length - 1 ? "1px solid #1a1a1a" : "none" }}>
+                            <div style={{ fontSize: 10, color: "#444", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 4 }}>Step {r.step}</div>
+                            <div style={{ fontSize: 20, fontWeight: 700, color: i === 0 ? "#888" : r.rate >= 70 ? GREEN : r.rate >= 40 ? AMBER : RED }}>{i === 0 ? "—" : `${r.rate}%`}</div>
+                            <div style={{ fontSize: 10, color: "#333", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 90 }}>{r.label}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   {bDropoff.length > 0 && (
                     <div style={{ marginTop: 16, background: "#111", border: "1px solid #1e1e1e", borderRadius: 8, padding: "20px 24px" }}>
                       <div style={{ fontSize: 12, color: "#555", marginBottom: 16 }}>Booking steps (9–10) · after completing the questionnaire</div>

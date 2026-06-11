@@ -741,31 +741,52 @@ app.get("/all-patients", async (_req, res) => {
   }
 });
 
+// ── Shared period filter builder for doc-app endpoints ───────────────────────
+// Priority: custom ?from/to > preset ?period > all-time (no filter)
+// Date inputs MUST match YYYY-MM-DD. Validated strings are cast as ::date in
+// SQL — never interpolated raw — so injection is not possible.
+const DOCAPP_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+type PeriodBounds = [string, string]; // [gte, lt)
+const DOCAPP_PERIOD_BOUNDS: Record<string, PeriodBounds | null> = {
+  all:       null,
+  this_week: ["DATE_TRUNC('week', CURRENT_DATE)",                      "DATE_TRUNC('week', CURRENT_DATE) + INTERVAL '7 days'"],
+  last_week: ["DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'",  "DATE_TRUNC('week', CURRENT_DATE)"],
+  last_30d:  ["CURRENT_DATE - INTERVAL '29 days'",                     "CURRENT_DATE + INTERVAL '1 day'"],
+  last_90d:  ["CURRENT_DATE - INTERVAL '89 days'",                     "CURRENT_DATE + INTERVAL '1 day'"],
+};
+
+function buildDocAppPeriodFilter(req: Request): {
+  df: (col: string) => string;
+  bookingDateFilter: string;
+  activePeriod: string;
+} {
+  const rawFrom = (req.query.from as string | undefined)?.trim();
+  const rawTo   = (req.query.to   as string | undefined)?.trim();
+  const safeFrom = rawFrom && DOCAPP_DATE_RE.test(rawFrom) ? rawFrom : null;
+  const safeTo   = rawTo   && DOCAPP_DATE_RE.test(rawTo)   ? rawTo   : null;
+
+  if (safeFrom) {
+    // Custom range — use validated strings cast as ::date
+    const toClause = safeTo ? ` AND {col} < '${safeTo}'::date` : "";
+    const df = (col: string) => `AND ${col} >= '${safeFrom}'::date${toClause.replace("{col}", col)}`;
+    const bookingDateFilter = `AND r.date::date >= '${safeFrom}'::date${safeTo ? ` AND r.date::date < '${safeTo}'::date` : ""}`;
+    return { df, bookingDateFilter, activePeriod: "custom" };
+  }
+
+  // Preset period
+  const period = (req.query.period as string) || "all";
+  const bounds = DOCAPP_PERIOD_BOUNDS[period] ?? null;
+  const df = (col: string) => bounds ? `AND ${col} >= ${bounds[0]} AND ${col} < ${bounds[1]}` : "";
+  const bookingDateFilter = bounds ? `AND r.date::date >= ${bounds[0]} AND r.date::date < ${bounds[1]}` : "";
+  return { df, bookingDateFilter, activePeriod: period };
+}
+
 // ── Funnel Analytics — live from doc-app RDS ──────────────────────────────────
 app.get("/funnel-analytics", async (req, res) => {
   const docUrl = process.env.DOCAPP_DATABASE_URL;
   if (!docUrl) { res.status(500).json({ error: "DOCAPP_DATABASE_URL not set" }); return; }
 
-  // period query param controls date range for ALL queries
-  // Valid values: all | this_week | last_week | last_30d | last_90d
-  const period = (req.query.period as string) || "all";
-  type PeriodBounds = [string, string]; // [gte, lt)
-  const PERIOD_BOUNDS: Record<string, PeriodBounds | null> = {
-    all: null,
-    this_week: ["DATE_TRUNC('week', CURRENT_DATE)", "DATE_TRUNC('week', CURRENT_DATE) + INTERVAL '7 days'"],
-    last_week: ["DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'", "DATE_TRUNC('week', CURRENT_DATE)"],
-    last_30d: ["CURRENT_DATE - INTERVAL '29 days'", "CURRENT_DATE + INTERVAL '1 day'"],
-    last_90d: ["CURRENT_DATE - INTERVAL '89 days'", "CURRENT_DATE + INTERVAL '1 day'"],
-  };
-  // df(col) → "AND col >= X AND col < Y" for the active period, empty when all
-  const df = (col: string): string => {
-    const b = PERIOD_BOUNDS[period];
-    return b ? `AND ${col} >= ${b[0]} AND ${col} < ${b[1]}` : "";
-  };
-  const bookingDateFilter = (() => {
-    const b = PERIOD_BOUNDS[period];
-    return b ? `AND r.date::date >= ${b[0]} AND r.date::date < ${b[1]}` : "";
-  })();
+  const { df, bookingDateFilter, activePeriod } = buildDocAppPeriodFilter(req);
 
   const sql = postgres(docUrl, { ssl: "require", max: 3 });
   try {
@@ -978,7 +999,7 @@ app.get("/funnel-analytics", async (req, res) => {
       states: states,
       bookingSourceStats: bookingSourceStats,
       adminBookers: adminBookers,
-      period: period,
+      period: activePeriod,
       fetchedAt: new Date(),
     });
   } catch (e: unknown) {
@@ -989,16 +1010,81 @@ app.get("/funnel-analytics", async (req, res) => {
   }
 });
 
-// ── GET /questionnaire-analytics ──────────────────────────────────────────────
-app.get("/questionnaire-analytics", async (_req, res) => {
+// ── GET /funnel-drop-waterfall ────────────────────────────────────────────────
+// Returns stage-by-stage conversion counts and rates for the lastCompletedForm
+// waterfall: registered → questionnaire → discharge → fees → treatmentplan.
+// Also returns consent-signed count and consent→no-booking dark zone count.
+app.get("/funnel-drop-waterfall", async (req, res) => {
   const docUrl = process.env.DOCAPP_DATABASE_URL;
   if (!docUrl) { res.status(500).json({ error: "DOCAPP_DATABASE_URL not set" }); return; }
 
+  const { df } = buildDocAppPeriodFilter(req);
+  const docSql = postgres(docUrl, { ssl: "require", max: 3 });
+  try {
+    const [waterfall, consentGap] = await Promise.all([
+      docSql.unsafe(`
+        SELECT
+          COUNT(*)::int                                                                                                         AS registered,
+          COUNT(*) FILTER (WHERE "lastCompletedForm" IN ('questionnaire','discharge','fees','treatmentplan'))::int             AS reached_questionnaire,
+          COUNT(*) FILTER (WHERE "lastCompletedForm" IN ('discharge','fees','treatmentplan'))::int                             AS reached_discharge,
+          COUNT(*) FILTER (WHERE "lastCompletedForm" IN ('fees','treatmentplan'))::int                                         AS reached_fees,
+          COUNT(*) FILTER (WHERE "lastCompletedForm" = 'treatmentplan')::int                                                   AS reached_treatmentplan
+        FROM patient
+        WHERE LOWER(COALESCE("fullName",'')) NOT LIKE '%test%'
+          AND LOWER(COALESCE(email,''))      NOT LIKE '%test%'
+          AND LOWER(COALESCE("fullName",'')) NOT LIKE '%zelda%'
+          AND LOWER(COALESCE(email,''))      NOT LIKE '%zelda%'
+          ${df('"createdAt"')}
+      `),
+      // Patients who signed consent but never booked a slot
+      docSql.unsafe(`
+        SELECT COUNT(DISTINCT cs.patient_id)::int AS consent_no_booking
+        FROM consentsubmission cs
+        JOIN patient p ON p.id = cs.patient_id
+        LEFT JOIN patientslot ps ON ps.patient_id = p."zohoID"
+        WHERE LOWER(COALESCE(p."fullName",'')) NOT LIKE '%test%'
+          AND LOWER(COALESCE(p.email,''))      NOT LIKE '%test%'
+          AND ps.patient_id IS NULL
+          ${df('p."createdAt"')}
+      `),
+    ]);
+
+    const w = waterfall[0] as unknown as {
+      registered: number; reached_questionnaire: number; reached_discharge: number;
+      reached_fees: number; reached_treatmentplan: number;
+    };
+    const rate = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
+
+    res.json({
+      stages: [
+        { stage: "registered",           label: "Registered",            count: w.registered,             pct_of_registered: 100,                              pct_of_prev: 100 },
+        { stage: "questionnaire",        label: "Questionnaire complete", count: w.reached_questionnaire,  pct_of_registered: rate(w.reached_questionnaire, w.registered),  pct_of_prev: rate(w.reached_questionnaire, w.registered) },
+        { stage: "discharge",            label: "Discharge letter",       count: w.reached_discharge,      pct_of_registered: rate(w.reached_discharge, w.registered),       pct_of_prev: rate(w.reached_discharge, w.reached_questionnaire) },
+        { stage: "fees",                 label: "Consultation fee paid",  count: w.reached_fees,           pct_of_registered: rate(w.reached_fees, w.registered),            pct_of_prev: rate(w.reached_fees, w.reached_discharge) },
+        { stage: "treatmentplan",        label: "Treatment plan",         count: w.reached_treatmentplan,  pct_of_registered: rate(w.reached_treatmentplan, w.registered),   pct_of_prev: rate(w.reached_treatmentplan, w.reached_fees) },
+      ],
+      consent_no_booking: (consentGap[0] as unknown as { consent_no_booking: number })?.consent_no_booking ?? 0,
+      fetchedAt: new Date(),
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    res.status(500).json({ error: msg });
+  } finally {
+    await docSql.end();
+  }
+});
+
+// ── GET /questionnaire-analytics ──────────────────────────────────────────────
+app.get("/questionnaire-analytics", async (req, res) => {
+  const docUrl = process.env.DOCAPP_DATABASE_URL;
+  if (!docUrl) { res.status(500).json({ error: "DOCAPP_DATABASE_URL not set" }); return; }
+
+  const { df } = buildDocAppPeriodFilter(req);
   const sql = postgres(docUrl, { ssl: "require", max: 3 });
   try {
     const [regToCompletion, stepDropoff, stepReach, lastCompletedForm, timingBuckets] = await Promise.all([
       // ── 1. Registration → questionnaire completion timing ──────────────
-      sql`
+      sql.unsafe(`
         SELECT
           ROUND(AVG(EXTRACT(EPOCH FROM (q_max - "createdAt"))/3600)::numeric, 1)                                             AS avg_hours,
           ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (q_max - "createdAt"))/3600)::numeric, 2)    AS median_hours,
@@ -1012,13 +1098,14 @@ app.get("/questionnaire-analytics", async (_req, res) => {
             AND LOWER(COALESCE(p.email, ''))      NOT LIKE '%test%'
             AND LOWER(COALESCE(p."fullName", '')) NOT LIKE '%zelda%'
             AND LOWER(COALESCE(p.email, ''))      NOT LIKE '%zelda%'
+            ${df('p."createdAt"')}
           GROUP BY p."patientID", p."createdAt"
           HAVING MAX(q."updatedAt") > p."createdAt"
             AND EXTRACT(EPOCH FROM (MAX(q."updatedAt") - p."createdAt"))/3600 BETWEEN 0 AND 720
         ) t
-      `,
+      `),
       // ── 2. Where users stopped (last step per session) ────────────────
-      sql`
+      sql.unsafe(`
         SELECT last_step, COUNT(*)::int AS sessions
         FROM (
           SELECT session_id, MAX(step) AS last_step
@@ -1031,14 +1118,15 @@ app.get("/questionnaire-analytics", async (_req, res) => {
                  OR LOWER(COALESCE("fullName", '')) LIKE '%zelda%'
                  OR LOWER(COALESCE(email, ''))      LIKE '%zelda%'
             )
+            AND user_id IN (SELECT "patientID" FROM patient WHERE 1=1 ${df('"createdAt"')})
           GROUP BY session_id
         ) t
         WHERE last_step BETWEEN 1 AND 12
         GROUP BY last_step
         ORDER BY last_step
-      `,
+      `),
       // ── 3. Unique users who reached each step ─────────────────────────
-      sql`
+      sql.unsafe(`
         SELECT step, COUNT(DISTINCT user_id)::int AS users
         FROM questionnaire_events
         WHERE user_id IS NOT NULL AND user_id != ''
@@ -1050,22 +1138,24 @@ app.get("/questionnaire-analytics", async (_req, res) => {
                OR LOWER(COALESCE("fullName", '')) LIKE '%zelda%'
                OR LOWER(COALESCE(email, ''))      LIKE '%zelda%'
           )
+          AND user_id IN (SELECT "patientID" FROM patient WHERE 1=1 ${df('"createdAt"')})
         GROUP BY step
         ORDER BY step
-      `,
+      `),
       // ── 4. Patient journey stage (lastCompletedForm) ──────────────────
-      sql`
+      sql.unsafe(`
         SELECT COALESCE("lastCompletedForm", 'none') AS stage, COUNT(*)::int AS cnt
         FROM patient
         WHERE LOWER(COALESCE("fullName", '')) NOT LIKE '%test%'
           AND LOWER(COALESCE(email, ''))      NOT LIKE '%test%'
           AND LOWER(COALESCE("fullName", '')) NOT LIKE '%zelda%'
           AND LOWER(COALESCE(email, ''))      NOT LIKE '%zelda%'
+          ${df('"createdAt"')}
         GROUP BY "lastCompletedForm"
         ORDER BY cnt DESC
-      `,
+      `),
       // ── 5. Timing distribution buckets ────────────────────────────────
-      sql`
+      sql.unsafe(`
         WITH timing AS (
           SELECT EXTRACT(EPOCH FROM (MAX(q."updatedAt") - p."createdAt"))/3600 AS h
           FROM patient p
@@ -1075,6 +1165,7 @@ app.get("/questionnaire-analytics", async (_req, res) => {
             AND LOWER(COALESCE(p.email, ''))      NOT LIKE '%test%'
             AND LOWER(COALESCE(p."fullName", '')) NOT LIKE '%zelda%'
             AND LOWER(COALESCE(p.email, ''))      NOT LIKE '%zelda%'
+            ${df('p."createdAt"')}
           GROUP BY p."patientID", p."createdAt"
           HAVING MAX(q."updatedAt") > p."createdAt"
             AND EXTRACT(EPOCH FROM (MAX(q."updatedAt") - p."createdAt"))/3600 BETWEEN 0 AND 720
@@ -1086,7 +1177,7 @@ app.get("/questionnaire-analytics", async (_req, res) => {
           COUNT(CASE WHEN h BETWEEN 2 AND 24  THEN 1 END)::int               AS h2_to_24h,
           COUNT(CASE WHEN h > 24              THEN 1 END)::int               AS over_24h
         FROM timing
-      `,
+      `),
     ]);
 
     // Step labels map
@@ -1442,8 +1533,9 @@ app.listen(PORT, () => {
   console.log(`  GET  /health-detail  → customer-index proxy`);
   console.log(`  GET  /shop-analytics → customer-index proxy`);
   console.log(`  GET  /all-patients           → analytics DB (all 25k+)`);
-  console.log(`  GET  /funnel-analytics        → doc-app RDS (live)`);
-  console.log(`  GET  /questionnaire-analytics → doc-app RDS (live)`);
+  console.log(`  GET  /funnel-analytics        → doc-app RDS (live) · ?period= or ?from=&to=`);
+  console.log(`  GET  /funnel-drop-waterfall   → doc-app RDS (live) · ?period= or ?from=&to=`);
+  console.log(`  GET  /questionnaire-analytics → doc-app RDS (live) · ?period= or ?from=&to=`);
   console.log(`  GET  /zoho-health             → Zoho CRM contacts + deals`);
   console.log(`  POST /ai-conversion-insights  → OpenAI GPT-4o-mini`);
 });
