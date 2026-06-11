@@ -13,7 +13,7 @@ out/
 .env.*.local
 
 # drizzle
-migrations/
+# migrations/ — committed intentionally for deployment
 
 # terraform
 infra/.terraform/
