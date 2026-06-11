@@ -76,22 +76,33 @@ jobs:
       - name: Package API Lambdas
         run: |
           for HANDLER in customers ingest; do
-            zip -j "/tmp/analytics-api-${HANDLER}.zip" \
-              "apps/api/dist/handlers/${HANDLER}.js"
+            mkdir -p "/tmp/analytics-api-${HANDLER}"
+            npx esbuild "apps/api/src/handlers/${HANDLER}.ts" \
+              --bundle --platform=node --target=node20 \
+              --outfile="/tmp/analytics-api-${HANDLER}/${HANDLER}.js" \
+              --external:pg-native
+            cd "/tmp/analytics-api-${HANDLER}" && zip -r "/tmp/analytics-api-${HANDLER}.zip" . && cd -
           done
 
       - name: Package Sync Lambdas
         run: |
           for HANDLER in zoho saleor doc-app; do
-            zip -j "/tmp/analytics-sync-${HANDLER}.zip" \
-              "apps/sync/dist/handlers/${HANDLER}.js"
+            mkdir -p "/tmp/analytics-sync-${HANDLER}"
+            npx esbuild "apps/sync/src/handlers/${HANDLER}.ts" \
+              --bundle --platform=node --target=node20 \
+              --outfile="/tmp/analytics-sync-${HANDLER}/${HANDLER}.js" \
+              --external:pg-native
+            cd "/tmp/analytics-sync-${HANDLER}" && zip -r "/tmp/analytics-sync-${HANDLER}.zip" . && cd -
           done
 
       - name: Package Migration Lambda
         run: |
           BUNDLE_DIR=/tmp/analytics-migration-bundle
           rm -rf "$BUNDLE_DIR" && mkdir -p "$BUNDLE_DIR"
-          cp packages/db/dist/migrate-lambda.js "$BUNDLE_DIR/index.js"
+          npx esbuild packages/db/src/migrate-lambda.ts \
+            --bundle --platform=node --target=node20 \
+            --outfile="$BUNDLE_DIR/index.js" \
+            --external:pg-native
           cp -r packages/db/migrations "$BUNDLE_DIR/migrations"
           cd "$BUNDLE_DIR" && zip -r /tmp/analytics-migration.zip .
 

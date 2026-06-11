@@ -9,6 +9,7 @@
     "db:migrate": "turbo run db:migrate --filter=@analytics/db"
   },
   "devDependencies": {
+    "esbuild": "^0.28.0",
     "turbo": "^2.1.3",
     "typescript": "^5.4.5"
   },
