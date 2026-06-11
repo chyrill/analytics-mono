@@ -40,6 +40,8 @@ jobs:
 
       - name: Build all packages
         run: pnpm build
+        env:
+          NEXT_PUBLIC_API_BASE: https://analytics-api.simdoar.net
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
