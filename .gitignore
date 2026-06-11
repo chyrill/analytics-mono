@@ -14,3 +14,9 @@ out/
 
 # drizzle
 migrations/
+
+# terraform
+infra/.terraform/
+infra/tfplan.out
+infra/**/.terraform/
+infra/**/placeholder.zip
