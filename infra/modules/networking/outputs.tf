@@ -13,6 +13,6 @@ output "nat_gateway_id" {
 }
 
 output "nat_public_ip" {
-  description = "Public IP of the NAT gateway — whitelist this at external APIs if needed"
-  value       = aws_eip.nat.public_ip
+  description = "Public IP of the NAT gateway - whitelist this at external APIs if needed"
+  value       = var.nat_eip_allocation_id != "" ? data.aws_eip.nat[0].public_ip : aws_eip.nat[0].public_ip
 }

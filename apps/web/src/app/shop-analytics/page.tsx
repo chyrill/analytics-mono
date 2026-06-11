@@ -177,8 +177,6 @@ export default function ShopAnalyticsPage() {
           <p style={{ fontSize: 13, color: "#666", marginTop: 4 }}>Revenue, conversion, fulfilment &amp; patient retention — last 6 months</p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <Link href="/health" style={navLink}>← Customer Health</Link>
-          <Link href="/" style={navLink}>Reconciliation →</Link>
           <button onClick={load} disabled={loading} style={ghostBtn}>⟳ Refresh</button>
         </div>
       </header>

@@ -17,6 +17,9 @@ import type {
 import type { ScheduledEvent } from "aws-lambda";
 import { handler as customersHandler } from "./handlers/customers";
 import { handler as ingestHandler } from "./handlers/ingest";
+import authRouter from "./routes/auth";
+import usersRouter from "./routes/users";
+import rolesRouter from "./routes/roles";
 import { handler as saleorHandler } from "../../sync/src/handlers/saleor";
 import { handler as docAppHandler } from "../../sync/src/handlers/doc-app";
 import { runZohoSync } from "../../sync/src/handlers/zoho";
@@ -35,11 +38,16 @@ app.use(express.text());
 // Allow the Next.js dev server (and any localhost origin) to call the API
 app.use((_req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
   if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
+
+// ── Auth & management routes ──────────────────────────────────────────────────
+app.use("/auth", authRouter);
+app.use("/users", usersRouter);
+app.use("/roles", rolesRouter);
 
 // ── Adapter: Express Request → APIGatewayProxyEventV2 ────────────────────────
 function toApiGwEvent(req: Request): APIGatewayProxyEventV2 {

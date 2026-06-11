@@ -42,6 +42,12 @@ variable "subnet_cidr_az_b" {
   default     = "172.31.49.0/24"
 }
 
+variable "nat_eip_allocation_id" {
+  type        = string
+  description = "Existing EIP allocation ID for the NAT gateway. Leave empty to create a new one."
+  default     = ""
+}
+
 variable "docapp_rds_security_group_id" {
   type        = string
   description = "Security group ID of the doc-app production RDS (postgresqlDB) — an ingress rule will be added to allow analytics Lambda access"

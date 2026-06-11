@@ -15,6 +15,10 @@ import * as syncJobsSchema from "./schema/sync-jobs";
 import * as syncCheckpointsSchema from "./schema/sync-checkpoints";
 import * as dbPatientsSchema from "./schema/db-patients";
 import * as dbTreatmentPlansSchema from "./schema/db-treatment-plans";
+import * as pagesSchema from "./schema/pages";
+import * as rolesSchema from "./schema/roles";
+import * as rolePagesSchema from "./schema/role-pages";
+import * as usersSchema from "./schema/users";
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
@@ -42,6 +46,10 @@ const schema = {
   ...syncCheckpointsSchema,
   ...dbPatientsSchema,
   ...dbTreatmentPlansSchema,
+  ...pagesSchema,
+  ...rolesSchema,
+  ...rolePagesSchema,
+  ...usersSchema,
 };
 
 export const db = drizzle(client, { schema });
@@ -60,3 +68,7 @@ export * from "./schema/sync-jobs";
 export * from "./schema/sync-checkpoints";
 export * from "./schema/db-patients";
 export * from "./schema/db-treatment-plans";
+export * from "./schema/pages";
+export * from "./schema/roles";
+export * from "./schema/role-pages";
+export * from "./schema/users";

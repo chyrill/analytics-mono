@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
 import Script from "next/script";
+import { AuthProvider } from "../contexts/AuthContext";
+import AuthGuard from "../components/AuthGuard";
+import Nav from "../components/Nav";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -17,8 +20,13 @@ export default function RootLayout({
       <head>
         <meta name="robots" content="noindex, nofollow" />
       </head>
-      <body style={{ fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", margin: 0, background: "#0f0f0f", color: "#e8e8e8", minHeight: "100vh" }}>
-        {children}
+      <body suppressHydrationWarning style={{ fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", margin: 0, background: "#0f0f0f", color: "#e8e8e8", minHeight: "100vh" }}>
+        <AuthProvider>
+          <AuthGuard>
+            <Nav />
+            {children}
+          </AuthGuard>
+        </AuthProvider>
         <Script
           src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
           strategy="beforeInteractive"

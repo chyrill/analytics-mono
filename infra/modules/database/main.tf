@@ -8,7 +8,7 @@ data "aws_subnet" "primary" {
 
 resource "aws_security_group" "rds" {
   name        = "${var.service_name}-${var.stage}-rds-sg"
-  description = "Analytics RDS PostgreSQL — inbound from Lambda only"
+  description = "Analytics RDS PostgreSQL - inbound from Lambda only"
   vpc_id      = data.aws_subnet.primary.vpc_id
 
   ingress {

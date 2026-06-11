@@ -10,6 +10,7 @@ module "networking" {
   public_subnet_id             = var.public_subnet_id
   subnet_cidr_az_a             = var.subnet_cidr_az_a
   subnet_cidr_az_b             = var.subnet_cidr_az_b
+  nat_eip_allocation_id        = var.nat_eip_allocation_id
   docapp_rds_security_group_id = var.docapp_rds_security_group_id
   service_name                 = var.service_name
   stage                        = var.stage

@@ -87,12 +87,18 @@ resource "aws_route53_record" "cert_validation" {
 }
 
 resource "aws_acm_certificate_validation" "web" {
-  count           = var.create_custom_domain && var.create_route53_records ? 1 : 0
+  # Wait for cert to be issued. When create_route53_records=false the DNS CNAME
+  # must be added manually; Terraform polls until the cert reaches ISSUED status.
+  count           = var.create_custom_domain ? 1 : 0
   provider        = aws.us_east_1
   certificate_arn = aws_acm_certificate.web[0].arn
-  validation_record_fqdns = [
+  validation_record_fqdns = var.create_route53_records ? [
     aws_route53_record.cert_validation[0].fqdn
-  ]
+  ] : []
+
+  timeouts {
+    create = "60m"
+  }
 }
 
 # ── CloudFront Function — SPA path rewriting ───────────────────────────────────
@@ -126,6 +132,8 @@ resource "aws_cloudfront_distribution" "web" {
   default_root_object = "index.html"
   price_class         = "PriceClass_All"
   aliases             = var.create_custom_domain ? [var.domain_name] : []
+
+  depends_on = [aws_acm_certificate_validation.web]
 
   origin {
     domain_name              = aws_s3_bucket.web.bucket_regional_domain_name

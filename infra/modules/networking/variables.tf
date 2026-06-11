@@ -5,7 +5,13 @@ variable "vpc_id" {
 
 variable "public_subnet_id" {
   type        = string
-  description = "An existing public subnet ID in the VPC — used to place the NAT gateway"
+  description = "An existing public subnet ID in the VPC - used to place the NAT gateway"
+}
+
+variable "nat_eip_allocation_id" {
+  type        = string
+  description = "Existing EIP allocation ID to use for the NAT gateway. Leave empty to create a new one."
+  default     = ""
 }
 
 variable "subnet_cidr_az_a" {

@@ -8,7 +8,9 @@ data "aws_vpc" "main" {
 # Placed in the existing public subnet so private subnets can reach the internet
 # (needed for Lambda egress to Zoho, Saleor, etc.)
 
+# Use an existing EIP to avoid hitting account limits (create one only if no allocation_id provided)
 resource "aws_eip" "nat" {
+  count  = var.nat_eip_allocation_id == "" ? 1 : 0
   domain = "vpc"
 
   tags = {
@@ -18,8 +20,17 @@ resource "aws_eip" "nat" {
   }
 }
 
+data "aws_eip" "nat" {
+  count = var.nat_eip_allocation_id != "" ? 1 : 0
+  id    = var.nat_eip_allocation_id
+}
+
+locals {
+  nat_eip_allocation_id = var.nat_eip_allocation_id != "" ? data.aws_eip.nat[0].id : aws_eip.nat[0].id
+}
+
 resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat.id
+  allocation_id = local.nat_eip_allocation_id
   subnet_id     = var.public_subnet_id
 
   tags = {
@@ -88,7 +99,7 @@ resource "aws_route_table_association" "private_b" {
 
 resource "aws_security_group" "analytics_lambda" {
   name        = "${var.service_name}-${var.stage}-lambda-sg"
-  description = "Analytics Lambda functions — controls egress to RDS and internet"
+  description = "Analytics Lambda functions - controls egress to RDS and internet"
   vpc_id      = data.aws_vpc.main.id
 
   # Egress: PostgreSQL within the VPC (analytics RDS + doc-app RDS)
@@ -126,7 +137,7 @@ resource "aws_vpc_security_group_ingress_rule" "docapp_rds_from_analytics" {
   from_port                    = 5432
   to_port                      = 5432
   ip_protocol                  = "tcp"
-  description                  = "Analytics ${var.stage} Lambda → doc-app RDS"
+  description                  = "Analytics ${var.stage} Lambda to doc-app RDS"
 
   tags = {
     Stage   = var.stage

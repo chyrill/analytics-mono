@@ -181,11 +181,6 @@ export default function ZohoHealthPage() {
           <p style={{ fontSize: 11, color: "#444", marginTop: 3 }}>{summary.total.toLocaleString()} contacts · {summary.withPlan.toLocaleString()} with active supply plan</p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <Link href="/health"           style={navLink}>Health Index →</Link>
-          <Link href="/shop-analytics"   style={navLink}>Shop Analytics →</Link>
-          <Link href="/funnel-analytics" style={navLink}>Funnel →</Link>
-          <Link href="/patients"         style={navLink}>Patients →</Link>
-          <Link href="/"                 style={navLink}>Reconciliation →</Link>
           <button onClick={load} disabled={loading} style={ghostBtn}>⟳ Refresh</button>
         </div>
       </header>

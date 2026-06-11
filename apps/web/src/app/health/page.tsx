@@ -215,11 +215,6 @@ export default function HealthIndexPage() {
           <p style={{ fontSize: 11, color: "#444", marginTop: 3 }}>Scope: shop-engaged cohort only · full patient base of 25,698 in <Link href="/" style={{ color: "#555", textDecoration: "underline" }}>Reconciliation</Link></p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <Link href="/zoho-health" style={navLink}>Zoho Health →</Link>
-          <Link href="/funnel-analytics" style={navLink}>Funnel Analytics →</Link>
-          <Link href="/patients" style={navLink}>Patient Registry →</Link>
-          <Link href="/shop-analytics" style={navLink}>Shop Analytics →</Link>
-          <Link href="/" style={navLink}>Reconciliation →</Link>
           <button onClick={() => load()} disabled={loading} style={ghostBtn}>⟳ Refresh</button>
           {/* <a href={`${API_BASE}/health-data/export?group=noplan`} style={ghostBtn as React.AnchorHTMLAttributes<HTMLAnchorElement>["style"]}>↓ No Plan CSV</a> */}
           <a href={`${API_BASE}/health-data/export`} style={ghostBtn as React.AnchorHTMLAttributes<HTMLAnchorElement>["style"]}>↓ All CSV</a>

@@ -117,10 +117,6 @@ export default function PatientRegistryPage() {
           <p style={{ fontSize: 13, color: "#666", marginTop: 4 }}>Every person who has ever touched Harvest — funnel registration through shop purchase</p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <Link href="/funnel-analytics" style={navLink}>Funnel Analytics →</Link>
-          <Link href="/health"            style={navLink}>Health Index →</Link>
-          <Link href="/shop-analytics"    style={navLink}>Shop Analytics →</Link>
-          <Link href="/"                style={navLink}>Reconciliation →</Link>
           <button onClick={load} disabled={loading} style={ghostBtn}>⟳ Refresh</button>
         </div>
       </header>

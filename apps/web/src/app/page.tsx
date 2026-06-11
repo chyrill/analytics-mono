@@ -257,10 +257,6 @@ export default function DashboardPage() {
           </p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <Link href="/funnel-analytics" style={{ fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px" }}>Funnel Analytics →</Link>
-          <Link href="/patients" style={{ fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px" }}>Patient Registry →</Link>
-          <Link href="/health" style={{ fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px" }}>Customer Health →</Link>
-          <Link href="/shop-analytics" style={{ fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px" }}>Shop Analytics →</Link>
           {isFirstSync && (
             <span style={{ fontSize: 11, color: "#f59e0b", background: "#451a03", border: "1px solid #78350f", borderRadius: 5, padding: "4px 10px" }}>
               First sync — may take a few minutes

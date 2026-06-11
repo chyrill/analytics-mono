@@ -258,10 +258,6 @@ export default function FunnelAnalyticsPage() {
           <p style={{ fontSize: 13, color: "#555", marginTop: 4 }}>Registration → consultation → treatment plan · profiling conversion opportunities{period !== "all" ? <span style={{ color: BLUE, marginLeft: 8, fontSize: 12 }}>· {PERIOD_LABELS[period]}</span> : null}</p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <Link href="/patients" style={navLink}>Patient Registry →</Link>
-          <Link href="/health" style={navLink}>Health Index →</Link>
-          <Link href="/shop-analytics" style={navLink}>Shop Analytics →</Link>
-          <Link href="/" style={navLink}>Reconciliation →</Link>
           <div style={{ display: "flex", gap: 2, background: "#0d0d0d", borderRadius: 7, padding: 3, border: "1px solid #222" }}>
             {(["all", "this_week", "last_week", "last_30d", "last_90d", "custom"] as const).map((p) => (
               <button key={p} onClick={() => setPeriod(p)} disabled={loading} style={{ background: period === p ? "#1a2e4a" : "transparent", color: period === p ? BLUE : "#666", border: "none", borderRadius: 5, padding: "4px 11px", fontSize: 11.5, fontWeight: period === p ? 600 : 400, cursor: "pointer", whiteSpace: "nowrap", transition: "all 0.15s" }}>

@@ -11,10 +11,11 @@ lambda_runtime = "nodejs20.x"
 
 # ── Networking ────────────────────────────────────────────────────────────────
 # Default VPC — where myproddb production RDS lives
-vpc_id           = "vpc-0377aacc56a5ecd18"
-public_subnet_id = "subnet-04a83ee804d50d8e1" # ap-southeast-2a public subnet for NAT GW
-subnet_cidr_az_a = "172.31.48.0/24"           # new analytics private subnet — ap-southeast-2a
-subnet_cidr_az_b = "172.31.49.0/24"           # new analytics private subnet — ap-southeast-2b
+vpc_id                = "vpc-0377aacc56a5ecd18"
+public_subnet_id      = "subnet-04a83ee804d50d8e1" # ap-southeast-2a public subnet for NAT GW
+nat_eip_allocation_id = "eipalloc-05d13f0ca0b805cd0" # existing unassociated EIP (52.65.177.54)
+subnet_cidr_az_a      = "172.31.48.0/24"             # new analytics private subnet - ap-southeast-2a
+subnet_cidr_az_b      = "172.31.49.0/24"             # new analytics private subnet - ap-southeast-2b
 
 # postgresqlDB SG on myproddb — analytics Lambda ingress rule will be added here
 docapp_rds_security_group_id = "sg-0b4a38ab820931d00"
