@@ -113,12 +113,16 @@ resource "aws_cloudfront_function" "spa_router" {
     function handler(event) {
       var request = event.request;
       var uri = request.uri;
-      // Pass through requests with a file extension
+      // Pass through requests with a file extension (assets, etc.)
       if (uri.match(/\.[a-zA-Z0-9]+$/)) {
         return request;
       }
-      // Rewrite all other paths to /index.html
-      request.uri = '/index.html';
+      // Append index.html for directory paths (Next.js static export layout)
+      if (uri.endsWith('/')) {
+        request.uri = uri + 'index.html';
+      } else {
+        request.uri = uri + '/index.html';
+      }
       return request;
     }
   EOF
