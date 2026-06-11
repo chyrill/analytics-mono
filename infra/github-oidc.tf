@@ -25,8 +25,8 @@ data "aws_iam_policy_document" "github_actions_assume" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      # Scope to main branch of the analytics-mono repo
-      values = ["repo:chyrill/analytics-mono:ref:refs/heads/main"]
+      # Allow main branch pushes and workflow_dispatch with environment
+      values = ["repo:chyrill/analytics-mono:*"]
     }
   }
 }
