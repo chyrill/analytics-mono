@@ -95,6 +95,11 @@ variable "saleor_api_token" {
   default   = ""
 }
 
+variable "saleor_api_url" {
+  type    = string
+  default = ""
+}
+
 variable "docapp_database_url" {
   type      = string
   sensitive = true

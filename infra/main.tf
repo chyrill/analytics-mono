@@ -75,6 +75,7 @@ module "workers" {
   zoho_client_secret     = var.zoho_client_secret
   zoho_refresh_token     = var.zoho_refresh_token
   saleor_api_token       = var.saleor_api_token
+  saleor_api_url         = var.saleor_api_url
   docapp_database_url    = var.docapp_database_url
   saleor_schedule        = var.saleor_schedule
   zoho_schedule          = var.zoho_schedule

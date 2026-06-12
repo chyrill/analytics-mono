@@ -109,6 +109,7 @@ resource "aws_lambda_function" "worker" {
       ZOHO_CLIENT_SECRET  = var.zoho_client_secret
       ZOHO_REFRESH_TOKEN  = var.zoho_refresh_token
       SALEOR_API_TOKEN    = var.saleor_api_token
+      SALEOR_API_URL      = var.saleor_api_url
       DOCAPP_DATABASE_URL = var.docapp_database_url
       NODE_ENV            = "production"
     }

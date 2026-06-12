@@ -82,7 +82,8 @@ function isRetryable(status: number): boolean {
 }
 
 async function gqlFetch<T>(query: string, variables: Record<string, unknown>): Promise<T> {
-  const endpoint = process.env.SALEOR_API_URL ?? "";
+  const endpoint = process.env.SALEOR_API_URL;
+  if (!endpoint) throw new Error("SALEOR_API_URL not set");
   const token = process.env.SALEOR_API_TOKEN;
   if (!token) throw new Error("SALEOR_API_TOKEN not set");
 
