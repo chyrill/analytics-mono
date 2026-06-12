@@ -79,6 +79,14 @@ jobs:
       - name: Package API Lambdas
         run: |
           for HANDLER in customers ingest sync auth users roles health; do
+            mkdir -p "/tmp/analytics-api-${HANDLER}"
+            npx esbuild "apps/api/src/handlers/${HANDLER}.ts" \
+              --bundle --platform=node --target=node20 \
+              --conditions=require \
+              --outfile="/tmp/analytics-api-${HANDLER}/${HANDLER}.js" \
+              --external:pg-native
+            cd "/tmp/analytics-api-${HANDLER}" && zip -r "/tmp/analytics-api-${HANDLER}.zip" . && cd -
+          done
 
       - name: Package Sync Lambdas
         run: |
@@ -109,6 +117,11 @@ jobs:
       - name: Deploy API Lambda function code
         run: |
           for HANDLER in customers ingest sync auth users roles health; do
+            aws lambda update-function-code \
+              --function-name "harvest-analytics-api-${HANDLER}-production" \
+              --zip-file "fileb:///tmp/analytics-api-${HANDLER}.zip" \
+              --region ap-southeast-2
+          done
 
       - name: Deploy Sync Lambda function code
         run: |
