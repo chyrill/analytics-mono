@@ -57,7 +57,7 @@ async function gqlFetch(query, variables) {
 async function fetchAllSaleorCustomers() {
     const results = [];
     let cursor = null;
-    for (;;) {
+    for (; ;) {
         const resp = await gqlFetch(SALEOR_CUSTOMERS_GQL, { after: cursor });
         for (const { node } of resp.customers.edges)
             results.push(node);
@@ -70,7 +70,7 @@ async function fetchAllSaleorCustomers() {
 async function fetchAllSaleorOrders() {
     const results = [];
     let cursor = null;
-    for (;;) {
+    for (; ;) {
         const resp = await gqlFetch(SALEOR_ORDERS_GQL, { after: cursor });
         for (const { node } of resp.orders.edges)
             results.push(node);
@@ -92,25 +92,25 @@ const handler = async (_event) => {
         await db_1.db
             .insert(db_1.customers)
             .values(batch.map((sc) => ({
-            email: sc.email.toLowerCase().trim(),
-            name: [sc.firstName, sc.lastName].filter(Boolean).join(" ") || null,
-            saleorCustomerId: sc.id,
-            reconciliationStatus: "gap",
-        })))
+                email: sc.email.toLowerCase().trim(),
+                name: [sc.firstName, sc.lastName].filter(Boolean).join(" ") || null,
+                saleorCustomerId: sc.id,
+                reconciliationStatus: "gap",
+            })))
             .onConflictDoUpdate({
-            target: db_1.customers.email,
-            set: {
-                saleorCustomerId: (0, drizzle_orm_1.sql) `excluded.saleor_customer_id`,
-                reconciliationStatus: (0, drizzle_orm_1.sql) `CASE
+                target: db_1.customers.email,
+                set: {
+                    saleorCustomerId: (0, drizzle_orm_1.sql)`excluded.saleor_customer_id`,
+                    reconciliationStatus: (0, drizzle_orm_1.sql)`CASE
             WHEN customers.zoho_contact_id IS NOT NULL
               AND customers.doc_app_patient_id IS NOT NULL THEN 'matched'
             WHEN customers.zoho_contact_id IS NOT NULL
               OR  customers.doc_app_patient_id IS NOT NULL THEN 'gap'
             ELSE 'gap'
           END`,
-                updatedAt: (0, drizzle_orm_1.sql) `now()`,
-            },
-        });
+                    updatedAt: (0, drizzle_orm_1.sql)`now()`,
+                },
+            });
         reconciled += batch.length;
     }
     console.log(`[saleor-sync] customers reconciled: ${reconciled}`);
@@ -141,13 +141,13 @@ const handler = async (_event) => {
             .insert(db_1.saleorOrders)
             .values(batch)
             .onConflictDoUpdate({
-            target: db_1.saleorOrders.sourceId,
-            set: {
-                totalGrams: (0, drizzle_orm_1.sql) `excluded.total_grams`,
-                orderedAt: (0, drizzle_orm_1.sql) `excluded.ordered_at`,
-                syncedAt: (0, drizzle_orm_1.sql) `now()`,
-            },
-        });
+                target: db_1.saleorOrders.sourceId,
+                set: {
+                    totalGrams: (0, drizzle_orm_1.sql)`excluded.total_grams`,
+                    orderedAt: (0, drizzle_orm_1.sql)`excluded.ordered_at`,
+                    syncedAt: (0, drizzle_orm_1.sql)`now()`,
+                },
+            });
         orderCount += batch.length;
     }
     console.log(`[saleor-sync] orders upserted: ${orderCount}`);

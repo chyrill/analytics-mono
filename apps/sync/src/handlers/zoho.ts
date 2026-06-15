@@ -204,13 +204,14 @@ async function getCheckpoint(source: string, entity: string): Promise<{ lastSync
   return rows[0] ?? null;
 }
 
-async function writeCheckpoint(source: string, entity: string, jobId: string, syncedAt: Date): Promise<void> {
+async function writeCheckpoint(source: string, entity: string, jobId: string | null | undefined, syncedAt: Date): Promise<void> {
+  const safeJobId = jobId ?? null;
   await db
     .insert(syncCheckpoints)
-    .values({ source, entity, lastSyncedAt: syncedAt, lastJobId: jobId })
+    .values({ source, entity, lastSyncedAt: syncedAt, lastJobId: safeJobId })
     .onConflictDoUpdate({
       target: [syncCheckpoints.source, syncCheckpoints.entity],
-      set: { lastSyncedAt: syncedAt, lastJobId: jobId },
+      set: { lastSyncedAt: syncedAt, lastJobId: safeJobId },
     });
 }
 

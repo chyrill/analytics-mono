@@ -137,7 +137,12 @@ app.post("/sync/zoho", async (_req, res) => {
     entities: ["contacts", "deals", "calls", "tasks", "events"],
     status: "running",
     startedAt: new Date(),
-  }).returning();
+  }).returning({ id: syncJobs.id });
+
+  if (!job?.id) {
+    res.status(500).json({ error: "failed_to_create_job" });
+    return;
+  }
 
   res.status(202).json({ job_id: job.id, source: "zoho", job_type: jobType, status: "started" });
 
@@ -164,7 +169,12 @@ app.post("/sync/saleor", async (_req, res) => {
   const [job] = await db.insert(syncJobs).values({
     source: "saleor", mode: "full", entities: ["customers", "orders"],
     status: "running", startedAt: new Date(),
-  }).returning();
+  }).returning({ id: syncJobs.id });
+
+  if (!job?.id) {
+    res.status(500).json({ error: "failed_to_create_job" });
+    return;
+  }
 
   res.status(202).json({ job_id: job.id, source: "saleor", job_type: "full", status: "started" });
 
@@ -195,7 +205,12 @@ app.post("/sync/db", async (_req, res) => {
 
   const [job] = await db.insert(syncJobs).values({
     source: "db", mode: "full", status: "running", startedAt: new Date(),
-  }).returning();
+  }).returning({ id: syncJobs.id });
+
+  if (!job?.id) {
+    res.status(500).json({ error: "failed_to_create_job" });
+    return;
+  }
 
   res.status(202).json({ job_id: job.id, source: "db", job_type: "full", status: "started" });
 
@@ -246,7 +261,12 @@ app.post("/sync/docapp", async (_req, res) => {
     entities: ["patients", "treatment_plans"],
     status: "running",
     startedAt: new Date(),
-  }).returning();
+  }).returning({ id: syncJobs.id });
+
+  if (!job?.id) {
+    res.status(500).json({ error: "failed_to_create_job" });
+    return;
+  }
 
   res.status(202).json({ job_id: job.id, source: "docapp", job_type: jobType, status: "started" });
 
@@ -264,6 +284,8 @@ app.post("/sync/docapp", async (_req, res) => {
 // ── GET /sync/jobs/:id ────────────────────────────────────────────────────────
 
 app.get("/sync/jobs/:id", async (req, res) => {
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!UUID_RE.test(req.params.id)) { res.status(400).json({ error: "invalid_job_id" }); return; }
   const rows = await db.select().from(syncJobs).where(eq(syncJobs.id, req.params.id)).limit(1);
   if (!rows.length) { res.status(404).json({ error: "not_found" }); return; }
   res.json(rows[0]);

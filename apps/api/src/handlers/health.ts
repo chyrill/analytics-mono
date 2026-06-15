@@ -50,6 +50,26 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     FROM supply_by_interval
     GROUP BY email
   ),
+  recent_supply AS (
+    SELECT DISTINCT ON (email, interval_key)
+      email,
+      interval_key,
+      supply_interval_total  AS allotted_this_interval,
+      supply_used_interval   AS used_this_interval
+    FROM supply_tracking
+    WHERE supply_interval_total IS NOT NULL
+      AND supply_interval_total::numeric > 0
+      AND interval_key >= CURRENT_DATE - INTERVAL '120 days'
+    ORDER BY email, interval_key, source_created_at DESC
+  ),
+  recent_totals AS (
+    SELECT
+      email,
+      SUM(allotted_this_interval::numeric) AS recent_allotted_g,
+      SUM(used_this_interval::numeric)     AS recent_used_g
+    FROM recent_supply
+    GROUP BY email
+  ),
   saleor_used AS (
     SELECT
       email,
@@ -78,7 +98,16 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     FROM cart_sessions
     WHERE is_deleted = false AND email IS NOT NULL${cartFilter}
     GROUP BY email
+  ),
+  last_order AS (
+    SELECT
+      email,
+      MAX(COALESCE(order_date::date, source_created_at::date)) AS last_order_date
+    FROM orders_dispatched
+    WHERE email IS NOT NULL
+    GROUP BY email
   )
+  SELECT * FROM (
   SELECT
     c.name                                                                 AS patient_name,
     zc.email                                                               AS email,
@@ -92,12 +121,38 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
     at.avg_allotted_g,
     CASE
+      -- No supply plan
       WHEN (at.allotted_g IS NULL OR at.allotted_g = 0) AND zc.supply_date IS NOT NULL THEN 'red'
-      WHEN at.allotted_g IS NULL OR at.allotted_g = 0  THEN NULL
-      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0) / at.allotted_g < 0.25
-           AND COALESCE(at.repeat_count, 0) >= 3 AND COALESCE(se.purchase_rate_pct, 100) >= 60 THEN 'purple'
-      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0) / at.allotted_g < 0.50 THEN 'green'
-      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0) / at.allotted_g < 0.75 THEN 'orange'
+      WHEN at.allotted_g IS NULL OR at.allotted_g = 0 THEN NULL
+      -- RED: most severe — checked first
+      WHEN rt.recent_allotted_g IS NOT NULL
+           AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) < 25 THEN 'red'
+      WHEN COALESCE(lo.last_order_date, se.last_visit) IS NULL
+           OR COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '90 days' THEN 'red'
+      WHEN tpt.script_expiration_date IS NOT NULL
+           AND tpt.script_expiration_date::date < CURRENT_DATE - INTERVAL '60 days' THEN 'red'
+      -- ORANGE: any moderate condition
+      WHEN rt.recent_allotted_g IS NOT NULL
+           AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 25 AND 50 THEN 'orange'
+      WHEN COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '45 days' THEN 'orange'
+      WHEN tpt.needs_update = true
+           OR (tpt.script_expiration_date IS NOT NULL
+               AND tpt.script_expiration_date::date BETWEEN CURRENT_DATE - INTERVAL '60 days' AND CURRENT_DATE) THEN 'orange'
+      -- PURPLE: all conditions required
+      WHEN rt.recent_allotted_g IS NOT NULL
+           AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 75 AND 110
+           AND COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '30 days'
+           AND COALESCE(at.repeat_count, 0) >= 3
+           AND (tpt.needs_update IS NULL OR tpt.needs_update = false)
+           AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE) THEN 'purple'
+      -- GREEN: (50-75% grams OR last purchase within 45 days) AND consult not overdue
+      WHEN (
+             (rt.recent_allotted_g IS NOT NULL
+              AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 50 AND 75)
+             OR COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '45 days'
+           )
+           AND (tpt.needs_update IS NULL OR tpt.needs_update = false)
+           AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE) THEN 'green'
       ELSE 'red'
     END                                                                    AS allowance_group,
     se.total_visits, se.total_purchases, se.purchase_rate_pct,
@@ -125,24 +180,27 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       WHEN (se.avg_visits_per_month < 1 OR se.avg_visits_per_month IS NULL)
            AND (at.allotted_g IS NULL OR COALESCE(su.used_g, 0) / at.allotted_g < 0.25) THEN 'at_risk'
       ELSE 'needs_review'
-    END AS customer_pattern
+    END AS customer_pattern,
+    lo.last_order_date AS last_order_date
   FROM zoho_contacts zc
-  LEFT JOIN allowance_totals at ON at.email = zc.email
-  LEFT JOIN saleor_used      su ON su.email = zc.email
-  LEFT JOIN shop_engagement  se ON se.email = zc.email
-  LEFT JOIN customers        c  ON c.email  = zc.email
+  LEFT JOIN allowance_totals at  ON at.email  = zc.email
+  LEFT JOIN saleor_used      su  ON su.email  = zc.email
+  LEFT JOIN shop_engagement  se  ON se.email  = zc.email
+  LEFT JOIN customers        c   ON c.email   = zc.email
+  LEFT JOIN recent_totals    rt  ON rt.email  = zc.email
+  LEFT JOIN last_order       lo  ON lo.email  = zc.email
+  LEFT JOIN db_treatment_plan_tracker tpt ON tpt.email = zc.email
   WHERE zc.email IS NOT NULL
-  ORDER BY
-    CASE
-      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75
-           AND se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60 THEN 1
-      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75    THEN 2
-      WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60   THEN 3
-      WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 4
-      WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 5
-      ELSE 6
-    END,
-    COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) DESC NULLS LAST
+) _health
+ORDER BY
+  CASE allowance_group
+    WHEN 'purple' THEN 1
+    WHEN 'green'  THEN 2
+    WHEN 'orange' THEN 3
+    WHEN 'red'    THEN 4
+    ELSE 5
+  END,
+  COALESCE(last_order_date, last_visit) DESC NULLS LAST
 `);
 }
 

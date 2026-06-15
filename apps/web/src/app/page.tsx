@@ -194,8 +194,12 @@ export default function DashboardPage() {
   function pollJob(source: string, jobId: string) {
     const tick = () => {
       fetch(`${API_BASE}/sync/jobs/${jobId}`)
-        .then((r) => r.json() as Promise<SyncJobStatus>)
+        .then((r) => {
+          if (!r.ok) { setSyncing((prev) => ({ ...prev, [source]: false })); return; }
+          return r.json() as Promise<SyncJobStatus>;
+        })
         .then((job) => {
+          if (!job) return;
           if (job.status === "completed" || job.status === "failed") {
             setSyncJobs((prev) => ({ ...prev, [source]: job }));
             setSyncing((prev) => ({ ...prev, [source]: false }));
@@ -216,10 +220,11 @@ export default function DashboardPage() {
 
     fetch(`${API_BASE}/sync/${source}`, { method: "POST" })
       .then((r) => {
-        if (r.status === 409) return r.json().then((d: { id: string }) => { pollJob(source, d.id); return null; });
-        return r.json() as Promise<{ id: string }>;
+        if (r.status === 409) return r.json().then((d: { job_id: string }) => { pollJob(source, d.job_id); return null; });
+        if (!r.ok) { setSyncing((prev) => ({ ...prev, [source]: false })); return null; }
+        return r.json() as Promise<{ job_id: string }>;
       })
-      .then((data) => { if (data) pollJob(source, data.id); })
+      .then((data) => { if (data) pollJob(source, data.job_id); })
       .catch(() => setSyncing((prev) => ({ ...prev, [source]: false })));
   }
 

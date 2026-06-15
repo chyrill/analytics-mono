@@ -50,6 +50,13 @@
       "when": 1781142032782,
       "tag": "0006_purple_swarm",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1781490409865,
+      "tag": "0007_public_alice",
+      "breakpoints": true
     }
   ]
 }

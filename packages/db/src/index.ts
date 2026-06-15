@@ -15,6 +15,7 @@ import * as syncJobsSchema from "./schema/sync-jobs";
 import * as syncCheckpointsSchema from "./schema/sync-checkpoints";
 import * as dbPatientsSchema from "./schema/db-patients";
 import * as dbTreatmentPlansSchema from "./schema/db-treatment-plans";
+import * as dbTreatmentPlanTrackerSchema from "./schema/db-treatment-plan-tracker";
 import * as pagesSchema from "./schema/pages";
 import * as rolesSchema from "./schema/roles";
 import * as rolePagesSchema from "./schema/role-pages";
@@ -46,6 +47,7 @@ const schema = {
   ...syncCheckpointsSchema,
   ...dbPatientsSchema,
   ...dbTreatmentPlansSchema,
+  ...dbTreatmentPlanTrackerSchema,
   ...pagesSchema,
   ...rolesSchema,
   ...rolePagesSchema,
@@ -68,6 +70,7 @@ export * from "./schema/sync-jobs";
 export * from "./schema/sync-checkpoints";
 export * from "./schema/db-patients";
 export * from "./schema/db-treatment-plans";
+export * from "./schema/db-treatment-plan-tracker";
 export * from "./schema/pages";
 export * from "./schema/roles";
 export * from "./schema/role-pages";

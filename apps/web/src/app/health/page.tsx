@@ -70,10 +70,10 @@ const GROUP_COLOR: Record<string, string> = {
 };
 
 const GROUP_CHIPS = [
-  { key: "purple", color: "#a855f7", label: "Active ≤25% rem", tip: "≤ 25% allowance remaining · ≥4 fills · ≥75% used · ≥60% conversion\nHigh adherence, actively purchasing." },
-  { key: "green", color: "#22c55e", label: "Green 25–50% rem", tip: "25–50% allowance remaining\nGood adherence — using most of allotment each interval." },
-  { key: "orange", color: "#f97316", label: "Orange 50–75%", tip: "50–75% allowance remaining\nModerate adherence — leaving a significant portion unused." },
-  { key: "red", color: "#ef4444", label: "Red >75% rem", tip: "> 75% allowance remaining\nLow adherence — rarely purchasing relative to treatment plan." },
+  { key: "purple", color: "#a855f7", label: "Adherent Advocates", tip: "Criteria (ALL required):\n· 75–110% of prescribed grams in last 90–120 days\n· Last purchase within 30 days\n· ≥ 3 purchase cycles completed\n· Consultation current\n\nActions: VIP program · Early product access\nReferral programs · Educational content\nGoal: Retain and delight." },
+  { key: "green", color: "#22c55e", label: "Stable Patients", tip: "Criteria (ANY):\n· 50–75% of prescribed grams, OR\n· Last purchase within 45 days\n· Consultation not overdue\n\nActions: Repeat reminders · Treatment education\nCheck product availability\nGoal: Move them to Purple." },
+  { key: "orange", color: "#f97316", label: "At-Risk Patients", tip: "Criteria (ANY):\n· 25–50% of prescribed grams, OR\n· No purchase in 46–90 days\n· Consultation due or recently overdue\n· Previously Purple/Green but declining\n\nActions: Care coordinator outreach · Re-book consultation\nInvestigate barriers\nGoal: Re-engage before churn." },
+  { key: "red", color: "#ef4444", label: "Disengaged", tip: "Criteria (ANY):\n· < 25% of prescribed grams, OR\n· No purchase > 90 days\n· Consultation overdue by > 60 days\n\nActions: Win-back campaign · Doctor review invitation\nRecovery survey\nGoal: Determine recovery or closure." },
   // { key: "__none", color: "#444", label: "No plan", tip: "No active treatment plan on file.\nSaleor-only customers or patients without a current prescription." },
 ];
 
@@ -240,51 +240,17 @@ export default function HealthIndexPage() {
         </div>
       </div>
 
-      {/* ── Period selector ── */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 32px", borderBottom: "1px solid #1a1a1a", flexWrap: "wrap" }}>
-        <span style={{ fontSize: 12, color: "#555" }}>Period</span>
-        {(["all", "Last 4 months", "Custom"] as const).map((label, i) => {
-          const key = (["all", "4m", "custom"] as const)[i];
-          return (
-            <button key={key}
-              onClick={() => { setPeriod(key); if (key !== "custom") load(key); }}
-              style={{ ...ghostBtn, border: period === key ? "1px solid #555" : "1px solid #2a2a2a", color: period === key ? "#fff" : "#555", background: period === key ? "#2a2a2a" : "#1a1a1a" }}>
-              {label === "all" ? "All-time" : label}
-            </button>
-          );
-        })}
-        {period === "custom" && (
-          <>
-            <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)}
-              style={{ ...searchInput, width: 140, padding: "6px 10px" }} />
-            <span style={{ color: "#444", fontSize: 12 }}>→</span>
-            <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)}
-              style={{ ...searchInput, width: 140, padding: "6px 10px" }} />
-            <button onClick={() => load("custom", dateFrom, dateTo)}
-              disabled={!dateFrom && !dateTo}
-              style={{ ...ghostBtn, border: "1px solid #555", color: "#fff" }}>
-              Apply
-            </button>
-          </>
-        )}
-      </div>
-
       {/* ── Controls ── */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 32px", borderBottom: "1px solid #1a1a1a", flexWrap: "wrap" }}>
         <input type="text" placeholder="Search name or email…" value={search}
           onChange={(e) => { setSearch(e.target.value); setPage(1); }} style={searchInput} />
-        <label style={{ fontSize: 12, color: "#555" }}>Pattern</label>
-        <select value={filterPattern} onChange={(e) => { setFilterPattern(e.target.value); setPage(1); }} style={selectStyle}>
-          <option value="">All patterns</option>
-          {Object.entries(PATTERN_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-        </select>
         <label style={{ fontSize: 12, color: "#555" }}>Allowance</label>
         <select value={filterGroup} onChange={(e) => { setFilterGroup(e.target.value); setPage(1); }} style={selectStyle}>
           <option value="">All groups</option>
-          <option value="purple">Purple — active, ≤25% remaining</option>
-          <option value="green">Green 25–50% remaining</option>
-          <option value="orange">Orange 50–75% remaining</option>
-          <option value="red">Red &gt;75% remaining</option>
+          <option value="purple">Purple — Adherent Advocates</option>
+          <option value="green">Green — Stable Patients</option>
+          <option value="orange">Orange — At-Risk Patients</option>
+          <option value="red">Red — Disengaged</option>
           {/* <option value="__none">No plan — unclassified</option> */}
         </select>
         <button
@@ -312,7 +278,6 @@ export default function HealthIndexPage() {
                 {([
                   ["patient_name", "Patient"],
                   ["email", "Email"],
-                  ["customer_pattern", "Pattern"],
                   ["allowance_group", "Group"],
                   ["allowance_pct", "Allowance %"],
                   ["allotted_g", "Allotted (g)"],
@@ -343,11 +308,6 @@ export default function HealthIndexPage() {
                   <td style={{ padding: "10px 12px", color: "#666", fontSize: 12, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                     title={r.email}>{r.email}</td>
                   <td style={{ padding: "10px 12px" }}>
-                    <span style={{ display: "inline-block", padding: "2px 8px", borderRadius: 4, fontSize: 11, fontWeight: 500, ...(PATTERN_STYLE[r.customer_pattern ?? ""] ?? PATTERN_STYLE.needs_review) }}>
-                      {PATTERN_LABEL[r.customer_pattern ?? ""] ?? r.customer_pattern ?? "—"}
-                    </span>
-                  </td>
-                  <td style={{ padding: "10px 12px" }}>
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12 }}>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", background: GROUP_COLOR[r.allowance_group ?? ""] ?? "#444", display: "inline-block" }} />
                       {r.allowance_group ?? "—"}
@@ -374,7 +334,7 @@ export default function HealthIndexPage() {
                 </tr>
               ))}
               {pageRows.length === 0 && (
-                <tr><td colSpan={19} style={{ padding: "60px 12px", textAlign: "center", color: "#555" }}>No records match the current filters.</td></tr>
+                <tr><td colSpan={18} style={{ padding: "60px 12px", textAlign: "center", color: "#555" }}>No records match the current filters.</td></tr>
               )}
             </tbody>
           </table>
@@ -401,9 +361,6 @@ export default function HealthIndexPage() {
                 <h2 style={{ fontSize: 16, fontWeight: 600, color: "#fff", margin: 0 }}>{panel.patient_name ?? panel.email}</h2>
                 <div style={{ fontSize: 12, color: "#555", marginTop: 4 }}>{panel.email}</div>
                 <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
-                  <span style={{ display: "inline-block", padding: "3px 8px", borderRadius: 4, fontSize: 11, fontWeight: 500, ...(PATTERN_STYLE[panel.customer_pattern ?? ""] ?? PATTERN_STYLE.needs_review) }}>
-                    {PATTERN_LABEL[panel.customer_pattern ?? ""] ?? "—"}
-                  </span>
                   {panel.allowance_group && (
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: 4, padding: "3px 8px" }}>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", background: GROUP_COLOR[panel.allowance_group] ?? "#444", display: "inline-block" }} />

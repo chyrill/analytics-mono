@@ -1,5 +1,5 @@
 import type { ScheduledHandler } from "aws-lambda";
-import { db, customers, reconciliationLog, supplyTracking, cartSessions, ordersDispatched, dbPatients, dbTreatmentPlans, syncCheckpoints, syncJobs } from "@analytics/db";
+import { db, customers, reconciliationLog, supplyTracking, cartSessions, ordersDispatched, dbPatients, dbTreatmentPlans, dbTreatmentPlanTracker, syncCheckpoints, syncJobs } from "@analytics/db";
 import { sql, eq, and } from "drizzle-orm";
 import postgres from "postgres";
 import type { Sql } from "postgres";
@@ -309,12 +309,13 @@ async function getCheckpoint(source: string, entity: string): Promise<Date | nul
   return rows[0]?.lastSyncedAt ?? null;
 }
 
-async function writeCheckpoint(source: string, entity: string, jobId: string, syncedAt: Date) {
+async function writeCheckpoint(source: string, entity: string, jobId: string | null | undefined, syncedAt: Date) {
+  const safeJobId = jobId ?? null;
   await db.insert(syncCheckpoints)
-    .values({ source, entity, lastSyncedAt: syncedAt, lastJobId: jobId })
+    .values({ source, entity, lastSyncedAt: syncedAt, lastJobId: safeJobId })
     .onConflictDoUpdate({
       target: [syncCheckpoints.source, syncCheckpoints.entity],
-      set: { lastSyncedAt: syncedAt, lastJobId: jobId },
+      set: { lastSyncedAt: syncedAt, lastJobId: safeJobId },
     });
 }
 
@@ -714,6 +715,193 @@ async function syncDocTreatmentPlans(
   return { fetched: rows.length, upserted };
 }
 
+// ── syncDocTreatmentPlanTracker ───────────────────────────────────────────────
+
+interface TreatmentPlanTrackerRow {
+  email: string;
+  synced_date: string | null;
+  repeats: number | null;
+  script_start_date: string | null;
+  script_expiration_date: string | null;
+  consulting_doctor: string | null;
+  supply_interval: number | null;
+  repeats_remaining_22: number | null;
+  repeats_remaining_26: number | null;
+  repeats_remaining_29: number | null;
+  supply_total_22: number | null;
+  supply_total_26: number | null;
+  supply_total_29: number | null;
+  supply_used_total_22: number | null;
+  supply_used_total_26: number | null;
+  supply_used_total_29: number | null;
+  supply_interval_total_22: number | null;
+  supply_interval_total_26: number | null;
+  supply_interval_total_29: number | null;
+  supply_used_interval_22: number | null;
+  supply_used_interval_26: number | null;
+  supply_used_interval_29: number | null;
+  supply_interval_start_22: string | null;
+  supply_interval_start_26: string | null;
+  supply_interval_start_29: string | null;
+  needs_update: boolean | null;
+}
+
+async function syncDocTreatmentPlanTracker(
+  conn: Sql,
+  jobId: string,
+): Promise<{ fetched: number; upserted: number }> {
+  const since = await getCheckpoint("docapp", "treatment_plan_tracker");
+  const syncedAt = new Date();
+
+  let rows: TreatmentPlanTrackerRow[];
+  if (since) {
+    console.log(`[docapp-sync] treatment_plan_tracker: incremental since ${since.toISOString()}`);
+    rows = await conn<TreatmentPlanTrackerRow[]>`
+      SELECT
+        lower(btrim(email))       AS email,
+        synced_date::text,
+        repeats,
+        script_start_date::text,
+        script_expiration_date::text,
+        consulting_doctor,
+        supply_interval,
+        repeats_remaining_22,
+        repeats_remaining_26,
+        repeats_remaining_29,
+        supply_total_22,
+        supply_total_26,
+        supply_total_29,
+        supply_used_total_22,
+        supply_used_total_26,
+        supply_used_total_29,
+        supply_interval_total_22,
+        supply_interval_total_26,
+        supply_interval_total_29,
+        supply_used_interval_22,
+        supply_used_interval_26,
+        supply_used_interval_29,
+        supply_interval_start_22::text,
+        supply_interval_start_26::text,
+        supply_interval_start_29::text,
+        "needsUpdate"             AS needs_update
+      FROM treatmentplantracker
+      WHERE email IS NOT NULL
+        AND btrim(email) != ''
+        AND synced_date > ${since}
+    `;
+  } else {
+    console.log("[docapp-sync] treatment_plan_tracker: full scan");
+    rows = await conn<TreatmentPlanTrackerRow[]>`
+      SELECT
+        lower(btrim(email))       AS email,
+        synced_date::text,
+        repeats,
+        script_start_date::text,
+        script_expiration_date::text,
+        consulting_doctor,
+        supply_interval,
+        repeats_remaining_22,
+        repeats_remaining_26,
+        repeats_remaining_29,
+        supply_total_22,
+        supply_total_26,
+        supply_total_29,
+        supply_used_total_22,
+        supply_used_total_26,
+        supply_used_total_29,
+        supply_interval_total_22,
+        supply_interval_total_26,
+        supply_interval_total_29,
+        supply_used_interval_22,
+        supply_used_interval_26,
+        supply_used_interval_29,
+        supply_interval_start_22::text,
+        supply_interval_start_26::text,
+        supply_interval_start_29::text,
+        "needsUpdate"             AS needs_update
+      FROM treatmentplantracker
+      WHERE email IS NOT NULL
+        AND btrim(email) != ''
+    `;
+  }
+
+  console.log(`[docapp-sync] fetched ${rows.length} treatment plan tracker rows`);
+  if (rows.length === 0) {
+    await writeCheckpoint("docapp", "treatment_plan_tracker", jobId, syncedAt);
+    return { fetched: 0, upserted: 0 };
+  }
+
+  let upserted = 0;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    await db.insert(dbTreatmentPlanTracker)
+      .values(batch.map((r) => ({
+        email: r.email,
+        syncedDate: r.synced_date,
+        repeats: r.repeats,
+        scriptStartDate: r.script_start_date,
+        scriptExpirationDate: r.script_expiration_date,
+        consultingDoctor: r.consulting_doctor,
+        supplyInterval: r.supply_interval,
+        repeatsRemaining22: r.repeats_remaining_22?.toString() ?? null,
+        repeatsRemaining26: r.repeats_remaining_26?.toString() ?? null,
+        repeatsRemaining29: r.repeats_remaining_29?.toString() ?? null,
+        supplyTotal22: r.supply_total_22?.toString() ?? null,
+        supplyTotal26: r.supply_total_26?.toString() ?? null,
+        supplyTotal29: r.supply_total_29?.toString() ?? null,
+        supplyUsedTotal22: r.supply_used_total_22?.toString() ?? null,
+        supplyUsedTotal26: r.supply_used_total_26?.toString() ?? null,
+        supplyUsedTotal29: r.supply_used_total_29?.toString() ?? null,
+        supplyIntervalTotal22: r.supply_interval_total_22?.toString() ?? null,
+        supplyIntervalTotal26: r.supply_interval_total_26?.toString() ?? null,
+        supplyIntervalTotal29: r.supply_interval_total_29?.toString() ?? null,
+        supplyUsedInterval22: r.supply_used_interval_22?.toString() ?? null,
+        supplyUsedInterval26: r.supply_used_interval_26?.toString() ?? null,
+        supplyUsedInterval29: r.supply_used_interval_29?.toString() ?? null,
+        supplyIntervalStart22: r.supply_interval_start_22,
+        supplyIntervalStart26: r.supply_interval_start_26,
+        supplyIntervalStart29: r.supply_interval_start_29,
+        needsUpdate: r.needs_update,
+      })))
+      .onConflictDoUpdate({
+        target: dbTreatmentPlanTracker.email,
+        set: {
+          syncedDate: sql`excluded.synced_date`,
+          repeats: sql`excluded.repeats`,
+          scriptStartDate: sql`excluded.script_start_date`,
+          scriptExpirationDate: sql`excluded.script_expiration_date`,
+          consultingDoctor: sql`excluded.consulting_doctor`,
+          supplyInterval: sql`excluded.supply_interval`,
+          repeatsRemaining22: sql`excluded.repeats_remaining_22`,
+          repeatsRemaining26: sql`excluded.repeats_remaining_26`,
+          repeatsRemaining29: sql`excluded.repeats_remaining_29`,
+          supplyTotal22: sql`excluded.supply_total_22`,
+          supplyTotal26: sql`excluded.supply_total_26`,
+          supplyTotal29: sql`excluded.supply_total_29`,
+          supplyUsedTotal22: sql`excluded.supply_used_total_22`,
+          supplyUsedTotal26: sql`excluded.supply_used_total_26`,
+          supplyUsedTotal29: sql`excluded.supply_used_total_29`,
+          supplyIntervalTotal22: sql`excluded.supply_interval_total_22`,
+          supplyIntervalTotal26: sql`excluded.supply_interval_total_26`,
+          supplyIntervalTotal29: sql`excluded.supply_interval_total_29`,
+          supplyUsedInterval22: sql`excluded.supply_used_interval_22`,
+          supplyUsedInterval26: sql`excluded.supply_used_interval_26`,
+          supplyUsedInterval29: sql`excluded.supply_used_interval_29`,
+          supplyIntervalStart22: sql`excluded.supply_interval_start_22`,
+          supplyIntervalStart26: sql`excluded.supply_interval_start_26`,
+          supplyIntervalStart29: sql`excluded.supply_interval_start_29`,
+          needsUpdate: sql`excluded.needs_update`,
+          syncedAt: sql`now()`,
+        },
+      });
+    upserted += batch.length;
+  }
+
+  await writeCheckpoint("docapp", "treatment_plan_tracker", jobId, syncedAt);
+  console.log(`[docapp-sync] db_treatment_plan_tracker upserted: ${upserted}`);
+  return { fetched: rows.length, upserted };
+}
+
 // ── runDocAppSync — entry point for /sync/docapp API route ───────────────────
 
 export async function runDocAppSync(jobId: string): Promise<{ fetched: number; upserted: number }> {
@@ -734,6 +922,10 @@ export async function runDocAppSync(jobId: string): Promise<{ fetched: number; u
     const t = await syncDocTreatmentPlans(conn, jobId);
     totalFetched += t.fetched;
     totalUpserted += t.upserted;
+
+    const tr = await syncDocTreatmentPlanTracker(conn, jobId);
+    totalFetched += tr.fetched;
+    totalUpserted += tr.upserted;
 
     return { fetched: totalFetched, upserted: totalUpserted };
   } finally {
