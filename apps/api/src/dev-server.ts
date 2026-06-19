@@ -392,7 +392,7 @@ function buildHealthQuery(from?: string, to?: string) {
     ROUND(at.allotted_g, 1)                                               AS allotted_g,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS bought_g,
     ROUND(at.avg_remaining_g, 1)                                          AS avg_remaining_g,
-    ROUND(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) * 100, 1)   AS allowance_pct,
+    ROUND(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) * 100, 1)   AS adherence_pct,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
     at.avg_allotted_g                                                     AS avg_allotted_g,
     CASE
@@ -408,7 +408,7 @@ function buildHealthQuery(from?: string, to?: string) {
       WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
              / at.allotted_g < 0.75                                       THEN 'orange'
       ELSE 'red'
-    END                                                                    AS allowance_group,
+    END                                                                    AS adherence_group,
     se.total_visits,
     se.total_purchases,
     se.purchase_rate_pct,
@@ -486,17 +486,17 @@ app.get("/health-data/export", async (req, res) => {
   try {
     const rows = enrichWithSaleor(toRows(await db.execute(buildHealthQuery(from, to))));
     const filtered = group === "noplan"
-      ? rows.filter((r) => r.allowance_group == null)
+      ? rows.filter((r) => r.adherence_group == null)
       : rows;
 
     const cols: [string, string][] = [
       ["patient_name", "Patient Name"],
       ["email", "Email"],
-      ["allowance_group", "Group"],
+      ["adherence_group", "Group"],
       ["allotted_g", "Allotted (g)"],
       ["bought_g", "Bought (g)"],
       ["avg_remaining_g", "Avg Rem (g)"],
-      ["allowance_pct", "Allowance %"],
+      ["adherence_pct", "Adherence %"],
       ["repeat_count", "Orders"],
       ["total_visits", "Visits"],
       ["purchase_rate_pct", "Conv %"],
@@ -1463,7 +1463,7 @@ const ZOHO_HEALTH_QUERY = sql.raw(`
     ROUND(at.allotted_g,      1)   AS allotted_g,
     ROUND(at.bought_g,        1)   AS bought_g,
     ROUND(at.avg_remaining_g, 1)   AS avg_remaining_g,
-    ROUND(at.adherence_ratio * 100, 1) AS allowance_pct,
+    ROUND(at.adherence_ratio * 100, 1) AS adherence_pct,
     ROUND(st.saleor_total_g,  1)   AS saleor_total_g,
     at.avg_allotted_g,
     -- Allowance group (same logic as health index)
@@ -1476,7 +1476,7 @@ const ZOHO_HEALTH_QUERY = sql.raw(`
       WHEN (at.avg_remaining_g / NULLIF(at.avg_allotted_g, 0)) < 0.50 THEN 'green'
       WHEN (at.avg_remaining_g / NULLIF(at.avg_allotted_g, 0)) < 0.75 THEN 'orange'
       ELSE 'red'
-    END                                                      AS allowance_group,
+    END                                                      AS adherence_group,
     -- Shop engagement (from doc-app sync)
     se.total_visits,
     se.total_purchases,
