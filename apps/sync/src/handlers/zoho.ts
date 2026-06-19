@@ -158,9 +158,21 @@ async function fetchAll<T>(token: string, module: string, fields: string): Promi
 
 /** Incremental fetch via search API — only records modified after `since`. */
 async function fetchIncremental<T>(token: string, module: string, fields: string, since: Date): Promise<T[]> {
+  const until = new Date();
+  return fetchIncrementalRange<T>(token, module, fields, since, until);
+}
+
+function formatZohoDateTime(value: Date): string {
+  return value.toISOString().replace(/\.\d{3}Z$/, "+00:00");
+}
+
+async function fetchIncrementalRange<T>(token: string, module: string, fields: string, from: Date, to: Date): Promise<T[]> {
+  if (from >= to) return [];
+
   const records: T[] = [];
-  const sinceStr = since.toISOString().replace(/\.\d{3}Z$/, "+00:00");
-  const criteria = encodeURIComponent(`(Modified_Time:greater_than:${sinceStr})`);
+  const fromStr = formatZohoDateTime(from);
+  const toStr = formatZohoDateTime(to);
+  const criteria = encodeURIComponent(`((Modified_Time:greater_equal:${fromStr})and(Modified_Time:less_than:${toStr}))`);
   let page = 1;
 
   for (; ;) {
@@ -173,6 +185,18 @@ async function fetchIncremental<T>(token: string, module: string, fields: string
     if (!text.trim()) break;
 
     if (!res.ok) {
+      if (text.includes('"code":"LIMIT_REACHED"')) {
+        const windowMs = to.getTime() - from.getTime();
+        if (windowMs <= 60_000) {
+          throw new Error(`Zoho ${module} incremental fetch exceeded search limit for 1-minute window starting ${from.toISOString()}`);
+        }
+
+        const midpoint = new Date(from.getTime() + Math.floor(windowMs / 2));
+        const left = await fetchIncrementalRange<T>(token, module, fields, from, midpoint);
+        const right = await fetchIncrementalRange<T>(token, module, fields, midpoint, to);
+        return [...left, ...right];
+      }
+
       throw new Error(`Zoho ${module} incremental fetch failed: ${res.status} — ${text.slice(0, 300)}`);
     }
 
@@ -184,6 +208,17 @@ async function fetchIncremental<T>(token: string, module: string, fields: string
     }
 
     if (data.code === "NO_DATA") break;
+    if (data.code === "LIMIT_REACHED") {
+      const windowMs = to.getTime() - from.getTime();
+      if (windowMs <= 60_000) {
+        throw new Error(`Zoho ${module} incremental fetch exceeded search limit for 1-minute window starting ${from.toISOString()}`);
+      }
+
+      const midpoint = new Date(from.getTime() + Math.floor(windowMs / 2));
+      const left = await fetchIncrementalRange<T>(token, module, fields, from, midpoint);
+      const right = await fetchIncrementalRange<T>(token, module, fields, midpoint, to);
+      return [...left, ...right];
+    }
     if (data.code && data.code !== "SUCCESS") throw new Error(`Zoho ${module} search error: ${data.message}`);
     if (!data.data?.length) break;
     records.push(...data.data);

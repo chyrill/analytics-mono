@@ -5,6 +5,64 @@ import { sql } from "drizzle-orm";
 const CORS = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+const GROUP_CRITERIA = {
+  purple: [
+    { code: "grams_75_110", flag: "is_purple_grams_75_110" },
+    { code: "purchase_within_30d", flag: "is_purple_recent_purchase_30" },
+    { code: "repeat_cycles_3_plus", flag: "is_purple_repeat_count_3" },
+    { code: "consultation_current", flag: "is_purple_consultation_current" },
+  ],
+  green: [
+    { code: "grams_50_75", flag: "is_green_grams_50_75" },
+    { code: "purchase_within_45d", flag: "is_green_recent_purchase_45" },
+    { code: "consultation_not_overdue", flag: "is_green_consultation_current" },
+  ],
+  orange: [
+    { code: "grams_25_50", flag: "is_orange_grams_25_50" },
+    { code: "purchase_46_90d", flag: "is_orange_no_purchase_46_90" },
+    { code: "consultation_due_or_recently_overdue", flag: "is_orange_consultation_due" },
+  ],
+  red: [
+    { code: "grams_below_25", flag: "is_red_low_grams" },
+    { code: "purchase_over_90d", flag: "is_red_no_purchase_90" },
+    { code: "consultation_overdue_60d", flag: "is_red_consultation_overdue_60" },
+  ],
+} as const;
+
+type GroupKey = keyof typeof GROUP_CRITERIA;
+type RawHealthRow = Record<string, unknown> & { allowance_group?: GroupKey | null };
+
+function toBoolean(value: unknown): boolean {
+  return value === true || value === "true" || value === 1 || value === "1";
+}
+
+function enrichHealthRows(rows: RawHealthRow[]) {
+  const criteriaCountsByGroup: Record<string, Record<string, number>> = {};
+
+  const enrichedRows = rows.map((row) => {
+    const group = row.allowance_group;
+    const criteria = group ? GROUP_CRITERIA[group] : undefined;
+    const matchedCriteria = criteria
+      ? criteria.filter(({ flag }) => toBoolean(row[flag])).map(({ code }) => code)
+      : [];
+
+    if (group) {
+      const groupCounts = (criteriaCountsByGroup[group] ??= {});
+      for (const code of matchedCriteria) {
+        groupCounts[code] = (groupCounts[code] ?? 0) + 1;
+      }
+    }
+
+    const cleaned = { ...row, matched_criteria: matchedCriteria } as Record<string, unknown>;
+    for (const groupCriteria of Object.values(GROUP_CRITERIA)) {
+      for (const { flag } of groupCriteria) delete cleaned[flag];
+    }
+    return cleaned;
+  });
+
+  return { rows: enrichedRows, criteriaCountsByGroup };
+}
+
 const toRows = <T = Record<string, unknown>>(r: unknown): T[] => Array.from(r as Iterable<T>);
 
 function ok(body: unknown, status = 200): APIGatewayProxyStructuredResultV2 {
@@ -120,39 +178,70 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     ROUND(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) * 100, 1)   AS allowance_pct,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
     at.avg_allotted_g,
+    COALESCE(lo.last_order_date, se.last_visit)                            AS last_activity_date,
+    (
+      rt.recent_allotted_g IS NOT NULL
+      AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) < 25
+    )                                                                      AS is_red_low_grams,
+    (
+      COALESCE(lo.last_order_date, se.last_visit) IS NULL
+      OR COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '90 days'
+    )                                                                      AS is_red_no_purchase_90,
+    (
+      tpt.script_expiration_date IS NOT NULL
+      AND tpt.script_expiration_date::date < CURRENT_DATE - INTERVAL '60 days'
+    )                                                                      AS is_red_consultation_overdue_60,
+    (
+      rt.recent_allotted_g IS NOT NULL
+      AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 25 AND 50
+    )                                                                      AS is_orange_grams_25_50,
+    (
+      COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '45 days'
+      AND COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '90 days'
+    )                                                                      AS is_orange_no_purchase_46_90,
+    (
+      tpt.needs_update = true
+      OR (
+        tpt.script_expiration_date IS NOT NULL
+        AND tpt.script_expiration_date::date BETWEEN CURRENT_DATE - INTERVAL '60 days' AND CURRENT_DATE
+      )
+    )                                                                      AS is_orange_consultation_due,
+    (
+      rt.recent_allotted_g IS NOT NULL
+      AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 75 AND 110
+    )                                                                      AS is_purple_grams_75_110,
+    (
+      COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '30 days'
+    )                                                                      AS is_purple_recent_purchase_30,
+    (COALESCE(at.repeat_count, 0) >= 3)                                    AS is_purple_repeat_count_3,
+    (
+      (tpt.needs_update IS NULL OR tpt.needs_update = false)
+      AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE)
+    )                                                                      AS is_purple_consultation_current,
+    (
+      rt.recent_allotted_g IS NOT NULL
+      AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 50 AND 75
+    )                                                                      AS is_green_grams_50_75,
+    (
+      COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '45 days'
+    )                                                                      AS is_green_recent_purchase_45,
+    (
+      (tpt.needs_update IS NULL OR tpt.needs_update = false)
+      AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE)
+    )                                                                      AS is_green_consultation_current,
     CASE
       -- No supply plan
       WHEN (at.allotted_g IS NULL OR at.allotted_g = 0) AND zc.supply_date IS NOT NULL THEN 'red'
       WHEN at.allotted_g IS NULL OR at.allotted_g = 0 THEN NULL
-      -- RED: most severe — checked first
-      WHEN rt.recent_allotted_g IS NOT NULL
-           AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) < 25 THEN 'red'
-      WHEN COALESCE(lo.last_order_date, se.last_visit) IS NULL
-           OR COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '90 days' THEN 'red'
-      WHEN tpt.script_expiration_date IS NOT NULL
-           AND tpt.script_expiration_date::date < CURRENT_DATE - INTERVAL '60 days' THEN 'red'
-      -- ORANGE: any moderate condition
-      WHEN rt.recent_allotted_g IS NOT NULL
-           AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 25 AND 50 THEN 'orange'
-      WHEN COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '45 days' THEN 'orange'
-      WHEN tpt.needs_update = true
-           OR (tpt.script_expiration_date IS NOT NULL
-               AND tpt.script_expiration_date::date BETWEEN CURRENT_DATE - INTERVAL '60 days' AND CURRENT_DATE) THEN 'orange'
-      -- PURPLE: all conditions required
-      WHEN rt.recent_allotted_g IS NOT NULL
-           AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 75 AND 110
-           AND COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '30 days'
-           AND COALESCE(at.repeat_count, 0) >= 3
-           AND (tpt.needs_update IS NULL OR tpt.needs_update = false)
-           AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE) THEN 'purple'
-      -- GREEN: (50-75% grams OR last purchase within 45 days) AND consult not overdue
-      WHEN (
-             (rt.recent_allotted_g IS NOT NULL
-              AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 50 AND 75)
-             OR COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '45 days'
-           )
-           AND (tpt.needs_update IS NULL OR tpt.needs_update = false)
-           AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE) THEN 'green'
+       -- Preserve the original allowance-band grouping used by the health page.
+       WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+           / NULLIF(at.allotted_g, 0) < 0.25
+         AND COALESCE(at.repeat_count, 0) >= 3
+         AND COALESCE(se.purchase_rate_pct, 100) >= 60 THEN 'purple'
+       WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+           / NULLIF(at.allotted_g, 0) < 0.50 THEN 'green'
+       WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
+           / NULLIF(at.allotted_g, 0) < 0.75 THEN 'orange'
       ELSE 'red'
     END                                                                    AS allowance_group,
     se.total_visits, se.total_purchases, se.purchase_rate_pct,
@@ -211,8 +300,9 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
   try {
     // GET /health-data
     if (routeKey === "GET /health-data") {
-      const rows = toRows(await db.execute(buildHealthQuery(qs.from, qs.to)));
-      return ok({ rows, count: rows.length });
+      const rows = toRows<RawHealthRow>(await db.execute(buildHealthQuery(qs.from, qs.to)));
+      const enriched = enrichHealthRows(rows);
+      return ok({ rows: enriched.rows, count: enriched.rows.length, criteriaCountsByGroup: enriched.criteriaCountsByGroup });
     }
 
     // GET /health-data/export
