@@ -26,9 +26,9 @@ interface ZohoHealthRow {
   allotted_g: number | null;
   bought_g: number | null;
   avg_remaining_g: number | null;
-  allowance_pct: number | null;
+  adherence_pct: number | null;
   saleor_total_g: number | null;
-  allowance_group: string | null;
+  adherence_group: string | null;
   total_visits: number | null;
   total_purchases: number | null;
   purchase_rate_pct: number | null;
@@ -86,10 +86,10 @@ const STATUS_STYLE: Record<string, React.CSSProperties> = {
   gray:   { background: "#1e1e1e", color: "#888",    border: "1px solid #333" },
 };
 const GROUP_CHIPS = [
-  { key: "purple", color: "#a855f7", label: "Active ≤25% rem",  tip: "≤ 25% allowance remaining · ≥4 fills · ≥75% used · ≥60% conversion" },
-  { key: "green",  color: "#22c55e", label: "Green 25–50% rem", tip: "25–50% allowance remaining · Good adherence" },
-  { key: "orange", color: "#f97316", label: "Orange 50–75%",    tip: "50–75% allowance remaining · Moderate adherence" },
-  { key: "red",    color: "#ef4444", label: "Red >75% rem",     tip: "> 75% allowance remaining · Low adherence" },
+  { key: "purple", color: "#a855f7", label: "High adherence",  tip: "Adherence >= 75% · >= 4 fills · >= 60% conversion" },
+  { key: "green",  color: "#22c55e", label: "Stable adherence", tip: "Adherence 50-74%" },
+  { key: "orange", color: "#f97316", label: "Watchlist",        tip: "Adherence 25-49%" },
+  { key: "red",    color: "#ef4444", label: "Low adherence",    tip: "Adherence < 25%" },
   { key: "__none", color: "#444",    label: "No plan",          tip: "No active treatment plan / supply data" },
 ];
 
@@ -101,7 +101,7 @@ export default function ZohoHealthPage() {
   const [filterPattern, setFilterPattern] = useState("");
   const [filterGroup, setFilterGroup]     = useState("");
   const [filterStatus, setFilterStatus]   = useState("");
-  const [sortCol, setSortCol]     = useState("allowance_pct");
+  const [sortCol, setSortCol]     = useState("adherence_pct");
   const [sortDir, setSortDir]     = useState<1 | -1>(-1);
   const [page, setPage]           = useState(1);
 
@@ -109,7 +109,18 @@ export default function ZohoHealthPage() {
     setLoading(true); setError(null);
     fetch(`${API_BASE}/zoho-health`)
       .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<{ rows: ZohoHealthRow[]; error?: string }>; })
-      .then((d) => { if (d.error) throw new Error(d.error); setAllRows(d.rows ?? []); })
+      .then((d) => {
+        if (d.error) throw new Error(d.error);
+        const normalized = (d.rows ?? []).map((row) => {
+          const legacy = row as ZohoHealthRow & { allowance_pct?: number | null; allowance_group?: string | null };
+          return {
+            ...row,
+            adherence_pct: row.adherence_pct ?? legacy.allowance_pct ?? null,
+            adherence_group: row.adherence_group ?? legacy.allowance_group ?? null,
+          };
+        });
+        setAllRows(normalized);
+      })
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
   }
@@ -117,7 +128,7 @@ export default function ZohoHealthPage() {
 
   const groupCounts = useMemo(() => {
     const c: Record<string, number> = {};
-    for (const r of allRows) { const k = r.allowance_group ?? "__none"; c[k] = (c[k] ?? 0) + 1; }
+    for (const r of allRows) { const k = r.adherence_group ?? "__none"; c[k] = (c[k] ?? 0) + 1; }
     return c;
   }, [allRows]);
 
@@ -132,7 +143,7 @@ export default function ZohoHealthPage() {
     expiring:   allRows.filter((r) => r.days_until_expiry != null && r.days_until_expiry >= 0 && r.days_until_expiry <= 30).length,
     wonDeals:   allRows.reduce((s, r) => s + r.won_deals, 0),
     openDeals:  allRows.reduce((s, r) => s + r.open_deals, 0),
-    withPlan:   allRows.filter((r) => r.allowance_group != null).length,
+    withPlan:   allRows.filter((r) => r.adherence_group != null).length,
   }), [allRows]);
 
   const filtered = useMemo(() => {
@@ -141,7 +152,7 @@ export default function ZohoHealthPage() {
       .filter((r) => {
         if (q && !((r.patient_name ?? "").toLowerCase().includes(q) || r.email.toLowerCase().includes(q))) return false;
         if (filterPattern && r.customer_pattern !== filterPattern) return false;
-        if (filterGroup && (r.allowance_group ?? "__none") !== filterGroup) return false;
+        if (filterGroup && (r.adherence_group ?? "__none") !== filterGroup) return false;
         if (filterStatus && (r.member_status ?? "Unknown") !== filterStatus) return false;
         return true;
       })
@@ -240,8 +251,8 @@ export default function ZohoHealthPage() {
                   <th onClick={() => handleSort("patient_name")}       style={thS("patient_name")}>Patient{arrow("patient_name")}</th>
                   <th onClick={() => handleSort("member_status")}      style={thS("member_status")}>CRM Status{arrow("member_status")}</th>
                   <th onClick={() => handleSort("customer_pattern")}   style={thS("customer_pattern")}>Pattern{arrow("customer_pattern")}</th>
-                  <th onClick={() => handleSort("allowance_group")}    style={thS("allowance_group")}>Group{arrow("allowance_group")}</th>
-                  <th onClick={() => handleSort("allowance_pct")}      style={{ ...thS("allowance_pct"), textAlign: "right" }}>Used %{arrow("allowance_pct")}</th>
+                  <th onClick={() => handleSort("adherence_group")}    style={thS("adherence_group")}>Group{arrow("adherence_group")}</th>
+                  <th onClick={() => handleSort("adherence_pct")}      style={{ ...thS("adherence_pct"), textAlign: "right" }}>Adherence %{arrow("adherence_pct")}</th>
                   <th onClick={() => handleSort("allotted_g")}         style={{ ...thS("allotted_g"), textAlign: "right" }}>Allotted g{arrow("allotted_g")}</th>
                   <th onClick={() => handleSort("bought_g")}           style={{ ...thS("bought_g"), textAlign: "right" }}>Bought g{arrow("bought_g")}</th>
                   <th onClick={() => handleSort("avg_remaining_g")}    style={{ ...thS("avg_remaining_g"), textAlign: "right" }}>Avg Rem g{arrow("avg_remaining_g")}</th>
@@ -257,7 +268,7 @@ export default function ZohoHealthPage() {
               </thead>
               <tbody>
                 {pageRows.map((row) => {
-                  const gc  = GROUP_COLOR[row.allowance_group ?? ""] ?? "#333";
+                  const gc  = GROUP_COLOR[row.adherence_group ?? ""] ?? "#333";
                   const ps  = PATTERN_STYLE[row.customer_pattern ?? ""] ?? PATTERN_STYLE.needs_review;
                   const ss  = STATUS_STYLE[row.status_colour] ?? STATUS_STYLE.gray;
                   const ex  = row.days_until_expiry;
@@ -279,14 +290,14 @@ export default function ZohoHealthPage() {
                           : <span style={{ color: "#333" }}>—</span>}
                       </td>
                       <td style={{ padding: "10px 12px" }}>
-                        {row.allowance_group
+                        {row.adherence_group
                           ? <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12 }}>
                               <span style={{ width: 8, height: 8, borderRadius: "50%", background: gc }} />
-                              <span style={{ color: gc }}>{row.allowance_group}</span>
+                              <span style={{ color: gc }}>{row.adherence_group}</span>
                             </span>
                           : <span style={{ color: "#333" }}>—</span>}
                       </td>
-                      <td style={numTd}>{fmt(row.allowance_pct)}%</td>
+                      <td style={numTd}>{fmt(row.adherence_pct)}%</td>
                       <td style={numTd}>{fmt(row.allotted_g)}</td>
                       <td style={numTd}>{fmt(row.bought_g)}</td>
                       <td style={numTd}>{fmt(row.avg_remaining_g)}</td>

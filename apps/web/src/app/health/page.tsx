@@ -12,8 +12,8 @@ interface HealthRow {
   email: string;
   matched_criteria?: string[];
   customer_pattern: string | null;
-  allowance_group: string | null;
-  allowance_pct: number | null;
+  adherence_group: string | null;
+  adherence_pct: number | null;
   allotted_g: number | null;
   bought_g: number | null;
   avg_remaining_g: number | null;
@@ -165,7 +165,7 @@ export default function HealthIndexPage() {
   const [filterGroup, setFilterGroup] = useState("");
   const [filterCriterion, setFilterCriterion] = useState("");
   const [hideNoplan, setHideNoplan] = useState(false);
-  const [sortCol, setSortCol] = useState("allowance_pct");
+  const [sortCol, setSortCol] = useState("adherence_pct");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [page, setPage] = useState(1);
   const [panel, setPanel] = useState<HealthRow | null>(null);
@@ -194,8 +194,40 @@ export default function HealthIndexPage() {
     fetch(`${API_BASE}/health-data${qs}`)
       .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<HealthDataResponse>; })
       .then((d) => {
-        setAllRows(d.rows ?? []);
-        setCriteriaCountsByGroup(d.criteriaCountsByGroup ?? {});
+        const normalized = (d.rows ?? []).map((row) => {
+          const legacy = row as HealthRow & { allowance_pct?: number | null; allowance_group?: string | null };
+          const adherencePct = row.adherence_pct ?? legacy.allowance_pct ?? null;
+          const matched = [...(row.matched_criteria ?? [])].filter((c) =>
+            !["grams_75_110", "grams_50_75", "grams_25_50", "grams_below_25"].includes(c),
+          );
+
+          if (adherencePct != null) {
+            if (adherencePct >= 75 && adherencePct <= 110) matched.push("grams_75_110");
+            else if (adherencePct >= 50 && adherencePct < 75) matched.push("grams_50_75");
+            else if (adherencePct >= 25 && adherencePct < 50) matched.push("grams_25_50");
+            else if (adherencePct < 25) matched.push("grams_below_25");
+          }
+
+          return {
+            ...row,
+            adherence_pct: adherencePct,
+            adherence_group: row.adherence_group ?? legacy.allowance_group ?? null,
+            matched_criteria: matched,
+          };
+        });
+
+        const localCriteriaCounts: Record<string, Record<string, number>> = {};
+        for (const row of normalized) {
+          const group = row.adherence_group;
+          if (!group) continue;
+          const bucket = (localCriteriaCounts[group] ??= {});
+          for (const code of row.matched_criteria ?? []) {
+            bucket[code] = (bucket[code] ?? 0) + 1;
+          }
+        }
+
+        setAllRows(normalized);
+        setCriteriaCountsByGroup(localCriteriaCounts);
       })
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
@@ -223,7 +255,7 @@ export default function HealthIndexPage() {
   const groupCounts = useMemo(() => {
     const c: Record<string, number> = {};
     for (const r of allRows) {
-      const key = r.allowance_group ?? "__none";
+      const key = r.adherence_group ?? "__none";
       c[key] = (c[key] ?? 0) + 1;
     }
     return c;
@@ -237,11 +269,11 @@ export default function HealthIndexPage() {
         if (q && !((r.patient_name ?? "").toLowerCase().includes(q) || r.email.toLowerCase().includes(q))) return false;
         if (filterPattern && r.customer_pattern !== filterPattern) return false;
         if (filterGroup) {
-          const rg = r.allowance_group ?? "__none";
+          const rg = r.adherence_group ?? "__none";
           if (rg !== filterGroup) return false;
         }
         if (filterCriterion && !(r.matched_criteria ?? []).includes(filterCriterion)) return false;
-        if (hideNoplan && r.allowance_group == null) return false;
+        if (hideNoplan && r.adherence_group == null) return false;
         return true;
       })
       .sort((a, b) => {
@@ -283,7 +315,7 @@ export default function HealthIndexPage() {
       <header style={{ padding: "24px 32px 16px", borderBottom: "1px solid #222", display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
           <h1 style={{ fontSize: 20, fontWeight: 600, color: "#fff", letterSpacing: "-0.3px", margin: 0 }}>Customer Health Index</h1>
-          <p style={{ fontSize: 13, color: "#666", marginTop: 4 }}>Patients with an active treatment plan <em style={{ fontStyle: "normal", color: "#444" }}>and</em> at least one shop visit — allowance adherence × engagement</p>
+          <p style={{ fontSize: 13, color: "#666", marginTop: 4 }}>Patients with an active treatment plan <em style={{ fontStyle: "normal", color: "#444" }}>and</em> at least one shop visit — adherence × engagement</p>
           <p style={{ fontSize: 11, color: "#444", marginTop: 3 }}>Scope: shop-engaged cohort only · full patient base of 25,698 in <Link href="/" style={{ color: "#555", textDecoration: "underline" }}>Reconciliation</Link></p>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -347,7 +379,7 @@ export default function HealthIndexPage() {
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 32px", borderBottom: "1px solid #1a1a1a", flexWrap: "wrap" }}>
         <input type="text" placeholder="Search name or email…" value={search}
           onChange={(e) => { setSearch(e.target.value); setPage(1); }} style={searchInput} />
-        <label style={{ fontSize: 12, color: "#555" }}>Allowance</label>
+        <label style={{ fontSize: 12, color: "#555" }}>Adherence Group</label>
         <select value={filterGroup} onChange={(e) => { setFilterGroup(e.target.value); setPage(1); }} style={selectStyle}>
           <option value="">All groups</option>
           <option value="purple">Purple — Adherent Advocates</option>
@@ -381,8 +413,8 @@ export default function HealthIndexPage() {
                 {([
                   ["patient_name", "Patient"],
                   ["email", "Email"],
-                  ["allowance_group", "Group"],
-                  ["allowance_pct", "Allowance %"],
+                  ["adherence_group", "Group"],
+                  ["adherence_pct", "Adherence %"],
                   ["allotted_g", "Allotted (g)"],
                   ["bought_g", "Bought (g)"],
                   ["avg_remaining_g", "Avg rem (g)"],
@@ -412,11 +444,11 @@ export default function HealthIndexPage() {
                     title={r.email}>{r.email}</td>
                   <td style={{ padding: "10px 12px" }}>
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12 }}>
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: GROUP_COLOR[r.allowance_group ?? ""] ?? "#444", display: "inline-block" }} />
-                      {r.allowance_group ?? "—"}
+                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: GROUP_COLOR[r.adherence_group ?? ""] ?? "#444", display: "inline-block" }} />
+                      {r.adherence_group ?? "—"}
                     </span>
                   </td>
-                  <td style={{ ...numTd, color: r.allowance_pct != null ? "#fff" : "#444", fontWeight: r.allowance_pct != null ? 500 : 400 }}>{fmt(r.allowance_pct)}%</td>
+                  <td style={{ ...numTd, color: r.adherence_pct != null ? "#fff" : "#444", fontWeight: r.adherence_pct != null ? 500 : 400 }}>{fmt(r.adherence_pct)}%</td>
                   <td style={numTd}>{fmt(r.allotted_g)}g</td>
                   <td style={numTd}>{fmt(r.bought_g)}g</td>
                   <td style={numTd}>{fmt(r.avg_remaining_g)}g</td>
@@ -464,10 +496,10 @@ export default function HealthIndexPage() {
                 <h2 style={{ fontSize: 16, fontWeight: 600, color: "#fff", margin: 0 }}>{panel.patient_name ?? panel.email}</h2>
                 <div style={{ fontSize: 12, color: "#555", marginTop: 4 }}>{panel.email}</div>
                 <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
-                  {panel.allowance_group && (
+                  {panel.adherence_group && (
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: 4, padding: "3px 8px" }}>
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: GROUP_COLOR[panel.allowance_group] ?? "#444", display: "inline-block" }} />
-                      {panel.allowance_group}
+                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: GROUP_COLOR[panel.adherence_group] ?? "#444", display: "inline-block" }} />
+                      {panel.adherence_group}
                     </span>
                   )}
                 </div>
@@ -477,7 +509,7 @@ export default function HealthIndexPage() {
             {/* Stats grid */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 1, background: "#1a1a1a", borderBottom: "1px solid #1a1a1a" }}>
               {[
-                ["Allowance", `${fmt(panel.allowance_pct)}%`],
+                ["Adherence", `${fmt(panel.adherence_pct)}%`],
                 ["Allotted", `${fmt(panel.allotted_g)}g`],
                 ["Repeats", String(panel.repeat_count ?? "—")],
                 ["Visits", String(panel.total_visits ?? "—")],

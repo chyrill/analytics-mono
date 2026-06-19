@@ -30,7 +30,7 @@ const GROUP_CRITERIA = {
 } as const;
 
 type GroupKey = keyof typeof GROUP_CRITERIA;
-type RawHealthRow = Record<string, unknown> & { allowance_group?: GroupKey | null };
+type RawHealthRow = Record<string, unknown> & { adherence_group?: GroupKey | null };
 
 function toBoolean(value: unknown): boolean {
   return value === true || value === "true" || value === 1 || value === "1";
@@ -40,7 +40,7 @@ function enrichHealthRows(rows: RawHealthRow[]) {
   const criteriaCountsByGroup: Record<string, Record<string, number>> = {};
 
   const enrichedRows = rows.map((row) => {
-    const group = row.allowance_group;
+    const group = row.adherence_group;
     const criteria = group ? GROUP_CRITERIA[group] : undefined;
     const matchedCriteria = criteria
       ? criteria.filter(({ flag }) => toBoolean(row[flag])).map(({ code }) => code)
@@ -108,25 +108,77 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     FROM supply_by_interval
     GROUP BY email
   ),
-  recent_supply AS (
-    SELECT DISTINCT ON (email, interval_key)
-      email,
-      interval_key,
-      supply_interval_total  AS allotted_this_interval,
-      supply_used_interval   AS used_this_interval
-    FROM supply_tracking
-    WHERE supply_interval_total IS NOT NULL
-      AND supply_interval_total::numeric > 0
-      AND interval_key >= CURRENT_DATE - INTERVAL '120 days'
-    ORDER BY email, interval_key, source_created_at DESC
-  ),
-  recent_totals AS (
+  tracker_latest AS (
     SELECT
-      email,
-      SUM(allotted_this_interval::numeric) AS recent_allotted_g,
-      SUM(used_this_interval::numeric)     AS recent_used_g
-    FROM recent_supply
-    GROUP BY email
+      tpt.email,
+      pick.interval_start,
+      pick.strength,
+      tpt.repeats::numeric AS repeats,
+      pick.supply_total_active,
+      pick.supply_used_interval_active,
+      pick.remaining_repeats_active
+    FROM db_treatment_plan_tracker tpt
+    LEFT JOIN LATERAL (
+      SELECT
+        x.strength,
+        x.interval_start,
+        x.supply_total_active,
+        x.supply_used_interval_active,
+        x.remaining_repeats_active
+      FROM (
+        VALUES
+          (
+            22,
+            NULLIF(tpt.supply_interval_start_22, '')::timestamptz,
+            tpt.supply_total_22::numeric,
+            tpt.supply_used_interval_22::numeric,
+            tpt.repeats_remaining_22::numeric
+          ),
+          (
+            26,
+            NULLIF(tpt.supply_interval_start_26, '')::timestamptz,
+            tpt.supply_total_26::numeric,
+            tpt.supply_used_interval_26::numeric,
+            tpt.repeats_remaining_26::numeric
+          ),
+          (
+            29,
+            NULLIF(tpt.supply_interval_start_29, '')::timestamptz,
+            tpt.supply_total_29::numeric,
+            tpt.supply_used_interval_29::numeric,
+            tpt.repeats_remaining_29::numeric
+          )
+      ) AS x(strength, interval_start, supply_total_active, supply_used_interval_active, remaining_repeats_active)
+      WHERE x.supply_total_active IS NOT NULL
+         OR x.supply_used_interval_active IS NOT NULL
+         OR x.remaining_repeats_active IS NOT NULL
+      ORDER BY
+        (x.interval_start IS NOT NULL) DESC,
+        x.interval_start DESC NULLS LAST
+      LIMIT 1
+    ) AS pick ON true
+  ),
+  adherence_calc AS (
+    SELECT
+      tl.email,
+      tl.strength,
+      tl.interval_start,
+      tl.repeats,
+      tl.supply_total_active,
+      tl.supply_used_interval_active,
+      tl.remaining_repeats_active,
+      (tl.supply_total_active / NULLIF(tl.repeats, 0)) AS grams_per_repeat,
+      ((tl.repeats - COALESCE(tl.remaining_repeats_active, 0))
+        * (tl.supply_total_active / NULLIF(tl.repeats, 0))) AS expected_used_g,
+      (
+        tl.supply_used_interval_active
+        / NULLIF(
+            ((tl.repeats - COALESCE(tl.remaining_repeats_active, 0))
+              * (tl.supply_total_active / NULLIF(tl.repeats, 0))),
+            0
+          )
+      ) AS adherence_ratio
+    FROM tracker_latest tl
   ),
   saleor_used AS (
     SELECT
@@ -171,17 +223,17 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     zc.email                                                               AS email,
     (c.created_at AT TIME ZONE 'Australia/Sydney')::date                  AS signed_up,
     at.repeat_count,
-    at.repeats_remaining,
+    COALESCE(ac.remaining_repeats_active, at.repeats_remaining::numeric) AS repeats_remaining,
     ROUND(at.allotted_g, 1)                                               AS allotted_g,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS bought_g,
     ROUND(at.avg_remaining_g, 1)                                          AS avg_remaining_g,
-    ROUND(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) * 100, 1)   AS allowance_pct,
+    ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) AS adherence_pct,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
     at.avg_allotted_g,
     COALESCE(lo.last_order_date, se.last_visit)                            AS last_activity_date,
     (
-      rt.recent_allotted_g IS NOT NULL
-      AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) < 25
+      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
+      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) < 25
     )                                                                      AS is_red_low_grams,
     (
       COALESCE(lo.last_order_date, se.last_visit) IS NULL
@@ -192,8 +244,8 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       AND tpt.script_expiration_date::date < CURRENT_DATE - INTERVAL '60 days'
     )                                                                      AS is_red_consultation_overdue_60,
     (
-      rt.recent_allotted_g IS NOT NULL
-      AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 25 AND 50
+      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
+      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 25 AND 50
     )                                                                      AS is_orange_grams_25_50,
     (
       COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '45 days'
@@ -207,8 +259,8 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       )
     )                                                                      AS is_orange_consultation_due,
     (
-      rt.recent_allotted_g IS NOT NULL
-      AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 75 AND 110
+      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
+      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 75 AND 110
     )                                                                      AS is_purple_grams_75_110,
     (
       COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '30 days'
@@ -219,8 +271,8 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE)
     )                                                                      AS is_purple_consultation_current,
     (
-      rt.recent_allotted_g IS NOT NULL
-      AND ROUND(rt.recent_used_g / NULLIF(rt.recent_allotted_g, 0) * 100, 1) BETWEEN 50 AND 75
+      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
+      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 50 AND 75
     )                                                                      AS is_green_grams_50_75,
     (
       COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '45 days'
@@ -231,19 +283,16 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     )                                                                      AS is_green_consultation_current,
     CASE
       -- No supply plan
-      WHEN (at.allotted_g IS NULL OR at.allotted_g = 0) AND zc.supply_date IS NOT NULL THEN 'red'
-      WHEN at.allotted_g IS NULL OR at.allotted_g = 0 THEN NULL
-       -- Preserve the original allowance-band grouping used by the health page.
-       WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
-           / NULLIF(at.allotted_g, 0) < 0.25
+      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
+        AND zc.supply_date IS NOT NULL THEN 'red'
+      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL THEN NULL
+       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
          AND COALESCE(at.repeat_count, 0) >= 3
          AND COALESCE(se.purchase_rate_pct, 100) >= 60 THEN 'purple'
-       WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
-           / NULLIF(at.allotted_g, 0) < 0.50 THEN 'green'
-       WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
-           / NULLIF(at.allotted_g, 0) < 0.75 THEN 'orange'
+       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.50 THEN 'green'
+       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.25 THEN 'orange'
       ELSE 'red'
-    END                                                                    AS allowance_group,
+    END                                                                    AS adherence_group,
     se.total_visits, se.total_purchases, se.purchase_rate_pct,
     se.avg_visits_per_month, se.avg_days_between_visits, se.last_visit,
     CASE
@@ -259,15 +308,21 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       ELSE NULL
     END AS conversion_tier,
     CASE
-      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75
+       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
            AND se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60 THEN 'loyal_power_buyer'
-      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75    THEN 'high_adherent'
+       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75 THEN 'high_adherent'
       WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60
-           AND (at.allotted_g IS NULL OR COALESCE(su.used_g, 0) / at.allotted_g < 0.75) THEN 'active_partial_buyer'
+         AND (
+           COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
+           OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.75
+         ) THEN 'active_partial_buyer'
       WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 'window_shopper'
       WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 'casual_buyer'
       WHEN (se.avg_visits_per_month < 1 OR se.avg_visits_per_month IS NULL)
-           AND (at.allotted_g IS NULL OR COALESCE(su.used_g, 0) / at.allotted_g < 0.25) THEN 'at_risk'
+         AND (
+           COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
+           OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.25
+         ) THEN 'at_risk'
       ELSE 'needs_review'
     END AS customer_pattern,
     lo.last_order_date AS last_order_date
@@ -276,13 +331,13 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
   LEFT JOIN saleor_used      su  ON su.email  = zc.email
   LEFT JOIN shop_engagement  se  ON se.email  = zc.email
   LEFT JOIN customers        c   ON c.email   = zc.email
-  LEFT JOIN recent_totals    rt  ON rt.email  = zc.email
+  LEFT JOIN adherence_calc   ac  ON ac.email  = zc.email
   LEFT JOIN last_order       lo  ON lo.email  = zc.email
   LEFT JOIN db_treatment_plan_tracker tpt ON tpt.email = zc.email
   WHERE zc.email IS NOT NULL
 ) _health
 ORDER BY
-  CASE allowance_group
+  CASE adherence_group
     WHEN 'purple' THEN 1
     WHEN 'green'  THEN 2
     WHEN 'orange' THEN 3
@@ -309,12 +364,12 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
     if (routeKey === "GET /health-data/export") {
       const rows = toRows(await db.execute(buildHealthQuery(qs.from, qs.to)));
       const group = qs.group?.trim();
-      const filtered = group === "noplan" ? rows.filter((r: Record<string, unknown>) => r.allowance_group == null) : rows;
+      const filtered = group === "noplan" ? rows.filter((r: Record<string, unknown>) => r.adherence_group == null) : rows;
 
       const cols: [string, string][] = [
-        ["patient_name", "Patient Name"], ["email", "Email"], ["allowance_group", "Group"],
+        ["patient_name", "Patient Name"], ["email", "Email"], ["adherence_group", "Group"],
         ["allotted_g", "Allotted (g)"], ["bought_g", "Bought (g)"], ["avg_remaining_g", "Avg Rem (g)"],
-        ["allowance_pct", "Allowance %"], ["repeat_count", "Orders"], ["total_visits", "Visits"],
+        ["adherence_pct", "Adherence %"], ["repeat_count", "Orders"], ["total_visits", "Visits"],
         ["purchase_rate_pct", "Conv %"], ["avg_visits_per_month", "Vis/mo"],
         ["last_visit", "Last Visit"], ["signed_up", "Signed Up"],
         ["customer_pattern", "Pattern"], ["visit_tier", "Visit Tier"], ["conversion_tier", "Conv Tier"],
