@@ -10,12 +10,14 @@
  */
 import express, { type Request, type Response } from "express";
 import type {
+  APIGatewayProxyHandlerV2,
   APIGatewayProxyEventV2,
   APIGatewayProxyStructuredResultV2,
 } from "aws-lambda";
 
 import type { ScheduledEvent } from "aws-lambda";
 import { handler as customersHandler } from "./handlers/customers";
+import { handler as healthHandler } from "./handlers/health";
 import { handler as ingestHandler } from "./handlers/ingest";
 import authRouter from "./routes/auth";
 import usersRouter from "./routes/users";
@@ -87,12 +89,10 @@ function toApiGwEvent(req: Request): APIGatewayProxyEventV2 {
 }
 
 // ── Adapter: Lambda result → Express Response ────────────────────────────────
-type Handler = (
-  event: APIGatewayProxyEventV2,
-) => Promise<APIGatewayProxyStructuredResultV2>;
+type Handler = APIGatewayProxyHandlerV2;
 
 async function invoke(handler: Handler, req: Request, res: Response) {
-  const result = await handler(toApiGwEvent(req));
+  const result = await handler(toApiGwEvent(req), {} as never, () => undefined);
   Object.entries(result.headers ?? {}).forEach(([k, v]) =>
     res.setHeader(k, String(v)),
   );
@@ -107,6 +107,12 @@ app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date() }));
 
 const fakeEvent = {} as ScheduledEvent;
 const noop = () => { };
+const invokeHealth = (req: Request, res: Response) =>
+  invoke((event) => healthHandler(event), req, res);
+
+app.get("/health-data", invokeHealth);
+app.get("/health-data/export", invokeHealth);
+app.get("/health-detail", invokeHealth);
 
 // ── Sync helpers ──────────────────────────────────────────────────────────────
 

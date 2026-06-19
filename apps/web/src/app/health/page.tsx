@@ -10,6 +10,7 @@ const PAGE_SIZE = 50;
 interface HealthRow {
   patient_name: string | null;
   email: string;
+  matched_criteria?: string[];
   customer_pattern: string | null;
   allowance_group: string | null;
   allowance_pct: number | null;
@@ -33,6 +34,25 @@ interface DetailData {
   gramsByMonth: { month: string; used_g: number; allotted_g: number | null }[];
   spendByMonth: { month: string; total_spent: number; order_count: number }[];
   summary: { total_spent: string; avg_monthly_spend: string; total_visits: number; avg_grams_per_interval: string };
+}
+
+interface HealthDataResponse {
+  rows: HealthRow[];
+  count: number;
+  criteriaCountsByGroup?: Record<string, Record<string, number>>;
+}
+
+interface GroupCriterion {
+  code: string;
+  label: string;
+}
+
+interface GroupChipConfig {
+  key: string;
+  color: string;
+  label: string;
+  mode: "ALL" | "ANY";
+  criteria: GroupCriterion[];
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -69,11 +89,52 @@ const GROUP_COLOR: Record<string, string> = {
   red: "#ef4444",
 };
 
-const GROUP_CHIPS = [
-  { key: "purple", color: "#a855f7", label: "Adherent Advocates", tip: "Criteria (ALL required):\n· 75–110% of prescribed grams in last 90–120 days\n· Last purchase within 30 days\n· ≥ 3 purchase cycles completed\n· Consultation current\n\nActions: VIP program · Early product access\nReferral programs · Educational content\nGoal: Retain and delight." },
-  { key: "green", color: "#22c55e", label: "Stable Patients", tip: "Criteria (ANY):\n· 50–75% of prescribed grams, OR\n· Last purchase within 45 days\n· Consultation not overdue\n\nActions: Repeat reminders · Treatment education\nCheck product availability\nGoal: Move them to Purple." },
-  { key: "orange", color: "#f97316", label: "At-Risk Patients", tip: "Criteria (ANY):\n· 25–50% of prescribed grams, OR\n· No purchase in 46–90 days\n· Consultation due or recently overdue\n· Previously Purple/Green but declining\n\nActions: Care coordinator outreach · Re-book consultation\nInvestigate barriers\nGoal: Re-engage before churn." },
-  { key: "red", color: "#ef4444", label: "Disengaged", tip: "Criteria (ANY):\n· < 25% of prescribed grams, OR\n· No purchase > 90 days\n· Consultation overdue by > 60 days\n\nActions: Win-back campaign · Doctor review invitation\nRecovery survey\nGoal: Determine recovery or closure." },
+const GROUP_CHIPS: GroupChipConfig[] = [
+  {
+    key: "purple",
+    color: "#a855f7",
+    label: "Adherent Advocates",
+    mode: "ALL",
+    criteria: [
+      { code: "grams_75_110", label: "75-110% of prescribed grams" },
+      { code: "purchase_within_30d", label: "Purchase within 30 days" },
+      { code: "repeat_cycles_3_plus", label: "3+ purchase cycles completed" },
+      { code: "consultation_current", label: "Consultation current" },
+    ],
+  },
+  {
+    key: "green",
+    color: "#22c55e",
+    label: "Stable Patients",
+    mode: "ANY",
+    criteria: [
+      { code: "grams_50_75", label: "50-75% of prescribed grams" },
+      { code: "purchase_within_45d", label: "Purchase within 45 days" },
+      { code: "consultation_not_overdue", label: "Consultation not overdue" },
+    ],
+  },
+  {
+    key: "orange",
+    color: "#f97316",
+    label: "At-Risk Patients",
+    mode: "ANY",
+    criteria: [
+      { code: "grams_25_50", label: "25-50% of prescribed grams" },
+      { code: "purchase_46_90d", label: "No purchase in 46-90 days" },
+      { code: "consultation_due_or_recently_overdue", label: "Consultation due or recently overdue" },
+    ],
+  },
+  {
+    key: "red",
+    color: "#ef4444",
+    label: "Disengaged",
+    mode: "ANY",
+    criteria: [
+      { code: "grams_below_25", label: "< 25% of prescribed grams" },
+      { code: "purchase_over_90d", label: "No purchase > 90 days" },
+      { code: "consultation_overdue_60d", label: "Consultation overdue by > 60 days" },
+    ],
+  },
   // { key: "__none", color: "#444", label: "No plan", tip: "No active treatment plan on file.\nSaleor-only customers or patients without a current prescription." },
 ];
 
@@ -96,11 +157,13 @@ const CHART_OPTS = {
 // ── Main component ─────────────────────────────────────────────────────────────
 export default function HealthIndexPage() {
   const [allRows, setAllRows] = useState<HealthRow[]>([]);
+  const [criteriaCountsByGroup, setCriteriaCountsByGroup] = useState<Record<string, Record<string, number>>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [filterPattern, setFilterPattern] = useState("");
   const [filterGroup, setFilterGroup] = useState("");
+  const [filterCriterion, setFilterCriterion] = useState("");
   const [hideNoplan, setHideNoplan] = useState(false);
   const [sortCol, setSortCol] = useState("allowance_pct");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
@@ -129,8 +192,11 @@ export default function HealthIndexPage() {
     const qs = from ? `?from=${from}${to ? `&to=${to}` : ""}` : "";
     setLoading(true); setError(null);
     fetch(`${API_BASE}/health-data${qs}`)
-      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<{ rows: HealthRow[]; count: number }>; })
-      .then((d) => setAllRows(d.rows ?? []))
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<HealthDataResponse>; })
+      .then((d) => {
+        setAllRows(d.rows ?? []);
+        setCriteriaCountsByGroup(d.criteriaCountsByGroup ?? {});
+      })
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
   }
@@ -174,6 +240,7 @@ export default function HealthIndexPage() {
           const rg = r.allowance_group ?? "__none";
           if (rg !== filterGroup) return false;
         }
+        if (filterCriterion && !(r.matched_criteria ?? []).includes(filterCriterion)) return false;
         if (hideNoplan && r.allowance_group == null) return false;
         return true;
       })
@@ -184,7 +251,12 @@ export default function HealthIndexPage() {
         if (av == null) return 1; if (bv == null) return -1;
         return av < bv ? sortDir : av > bv ? -sortDir : 0;
       });
-  }, [allRows, search, filterPattern, filterGroup, hideNoplan, sortCol, sortDir]);
+  }, [allRows, search, filterPattern, filterGroup, filterCriterion, hideNoplan, sortCol, sortDir]);
+
+  const selectedGroupConfig = useMemo(
+    () => GROUP_CHIPS.find((group) => group.key === filterGroup) ?? null,
+    [filterGroup],
+  );
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -226,9 +298,14 @@ export default function HealthIndexPage() {
         {GROUP_CHIPS.map((g) => (
           <GroupChip
             key={g.key} color={g.color} count={groupCounts[g.key] ?? 0}
-            label={g.label} tip={g.tip}
+            label={g.label}
             active={filterGroup === g.key}
-            onClick={() => { setFilterGroup(filterGroup === g.key ? "" : g.key); setPage(1); }}
+            onClick={() => {
+              const nextGroup = filterGroup === g.key ? "" : g.key;
+              setFilterGroup(nextGroup);
+              setFilterCriterion("");
+              setPage(1);
+            }}
           />
         ))}
         <div style={{ marginLeft: "auto", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, background: "#1a1a1a", border: "1px solid #222", borderRadius: 6, padding: "8px 14px", fontSize: 12 }}>
@@ -239,6 +316,32 @@ export default function HealthIndexPage() {
           {/* <div style={{ fontSize: 11, color: "#444" }}>of 25,698 total · <Link href="/" style={{ color: "#555", textDecoration: "underline" }}>25,615 doc-app</Link> · 2,533 saleor · 83 saleor-only</div> */}
         </div>
       </div>
+
+      {selectedGroupConfig && (
+        <div style={{ display: "flex", gap: 8, padding: "12px 32px", borderBottom: "1px solid #1a1a1a", flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ fontSize: 12, color: "#555" }}>{selectedGroupConfig.label} criteria ({selectedGroupConfig.mode}):</span>
+          <CriteriaPill
+            label="All criteria"
+            count={groupCounts[selectedGroupConfig.key] ?? 0}
+            active={filterCriterion === ""}
+            color={selectedGroupConfig.color}
+            onClick={() => { setFilterCriterion(""); setPage(1); }}
+          />
+          {selectedGroupConfig.criteria.map((criterion) => (
+            <CriteriaPill
+              key={criterion.code}
+              label={criterion.label}
+              count={criteriaCountsByGroup[selectedGroupConfig.key]?.[criterion.code] ?? 0}
+              active={filterCriterion === criterion.code}
+              color={selectedGroupConfig.color}
+              onClick={() => {
+                setFilterCriterion((current) => current === criterion.code ? "" : criterion.code);
+                setPage(1);
+              }}
+            />
+          ))}
+        </div>
+      )}
 
       {/* ── Controls ── */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 32px", borderBottom: "1px solid #1a1a1a", flexWrap: "wrap" }}>
@@ -495,28 +598,48 @@ function DetailCharts({ detail }: { detail: DetailData }) {
 }
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
-function GroupChip({ color, count, label, tip, active, onClick }: {
-  color: string; count: number; label: string; tip: string; active: boolean; onClick: () => void;
+function GroupChip({ color, count, label, active, onClick }: {
+  color: string; count: number; label: string; active: boolean; onClick: () => void;
 }) {
-  const [hov, setHov] = useState(false);
   return (
-    <div onClick={onClick} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
+    <div onClick={onClick}
       style={{
-        display: "flex", alignItems: "center", gap: 8, background: active ? "#1e1e2e" : hov ? "#222" : "#1a1a1a",
-        border: `1px solid ${active ? color : hov ? "#444" : "#222"}`, boxShadow: active ? `0 0 0 1px ${color}` : "none",
-        borderRadius: 6, padding: "6px 12px", fontSize: 12, cursor: "pointer", userSelect: "none", transition: "all 0.15s", position: "relative"
+        display: "flex", alignItems: "center", gap: 8, background: active ? "#1e1e2e" : "#1a1a1a",
+        border: `1px solid ${active ? color : "#222"}`, boxShadow: active ? `0 0 0 1px ${color}` : "none",
+        borderRadius: 6, padding: "6px 12px", fontSize: 12, cursor: "pointer", userSelect: "none", transition: "all 0.15s"
       }}>
       <span style={{ width: 8, height: 8, borderRadius: "50%", background: color, flexShrink: 0 }} />
       <span style={{ fontWeight: 600, color: "#fff" }}>{count.toLocaleString()}</span>
       <span style={{ color: active ? "#aaa" : "#666" }}>{label}</span>
-      {hov && (
-        <div style={{
-          position: "absolute", top: "calc(100% + 8px)", left: 0, background: "#1e1e1e", border: "1px solid #333", borderRadius: 8,
-          padding: "10px 14px", fontSize: 12, lineHeight: 1.6, color: "#ccc", whiteSpace: "pre-line", minWidth: 200, maxWidth: 260,
-          zIndex: 200, pointerEvents: "none", boxShadow: "0 8px 24px rgba(0,0,0,0.5)"
-        }}>{tip}</div>
-      )}
     </div>
+  );
+}
+
+function CriteriaPill({ label, count, active, color, onClick }: {
+  label: string;
+  count: number;
+  active: boolean;
+  color: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: active ? "#1e1e2e" : "#1a1a1a",
+        border: `1px solid ${active ? color : "#2a2a2a"}`,
+        color: active ? "#fff" : "#aaa",
+        borderRadius: 999,
+        padding: "6px 10px",
+        fontSize: 12,
+        cursor: "pointer",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+      }}>
+      <span>{label}</span>
+      <span style={{ color: active ? "#fff" : "#666", fontVariantNumeric: "tabular-nums" }}>{count.toLocaleString()}</span>
+    </button>
   );
 }
 
