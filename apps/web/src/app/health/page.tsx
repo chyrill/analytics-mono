@@ -55,6 +55,14 @@ interface GroupChipConfig {
   criteria: GroupCriterion[];
 }
 
+interface SnapshotNote {
+  id: string;
+  noteText: string;
+  label: string | null;
+  createdAt: string;
+  cohortCounts: Record<string, number>;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function fmt(v: number | string | null, decimals = 1): string {
   if (v == null || v === "") return "—";
@@ -174,6 +182,50 @@ export default function HealthIndexPage() {
   const [period, setPeriod] = useState<"all" | "4m" | "custom">("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const [notes, setNotes] = useState<SnapshotNote[]>([]);
+  const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
+  const [showCreateNote, setShowCreateNote] = useState(false);
+  const [noteText, setNoteText] = useState("");
+  const [noteLabel, setNoteLabel] = useState("feature_launch");
+  const [notesBusy, setNotesBusy] = useState(false);
+  const [noteMsg, setNoteMsg] = useState<string | null>(null);
+  const [noteErr, setNoteErr] = useState<string | null>(null);
+  const [notesApiReady, setNotesApiReady] = useState(true);
+
+  const loadNotes = useCallback(async () => {
+    try {
+      setNotesBusy(true);
+      setNoteErr(null);
+      const response = await fetch(`${API_BASE}/health-notes?scope=health`);
+      if (!response.ok) {
+        // Graceful fallback while API routes/migrations are not yet deployed.
+        if (response.status === 404 || response.status >= 500) {
+          setNotes([]);
+          setSelectedNoteId(null);
+          setNotesApiReady(false);
+          return;
+        }
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = await response.json() as {
+        notes: Array<{
+          id: string;
+          noteText: string;
+          label: string | null;
+          createdAt: string;
+          cohortCounts: Record<string, number>;
+        }>;
+      };
+      setNotesApiReady(true);
+      setNotes(payload.notes ?? []);
+      setSelectedNoteId((current) => current ?? payload.notes?.[0]?.id ?? null);
+    } catch (e) {
+      console.error("Failed to load notes", e);
+      setNotesApiReady(false);
+    } finally {
+      setNotesBusy(false);
+    }
+  }, []);
 
   function load(overridePeriod?: "all" | "4m" | "custom", overrideFrom?: string, overrideTo?: string) {
     const activePeriod = overridePeriod ?? period;
@@ -234,6 +286,7 @@ export default function HealthIndexPage() {
   }
 
   useEffect(() => { load(); }, []);
+  useEffect(() => { void loadNotes(); }, [loadNotes]);
   useEffect(() => {
     const h = (e: KeyboardEvent) => { if (e.key === "Escape") setPanel(null); };
     window.addEventListener("keydown", h);
@@ -260,6 +313,81 @@ export default function HealthIndexPage() {
     }
     return c;
   }, [allRows]);
+
+  const selectedNote = useMemo(
+    () => notes.find((note) => note.id === selectedNoteId) ?? null,
+    [notes, selectedNoteId],
+  );
+
+  const baselineCounts = selectedNote?.cohortCounts ?? null;
+
+  const fmtDelta = useCallback((groupKey: string, currentCount: number) => {
+    if (!baselineCounts) return null;
+    const base = baselineCounts[groupKey] ?? 0;
+    if (base === 0) return { value: currentCount, pct: 100, positive: currentCount >= 0 };
+    const value = currentCount - base;
+    const pct = (value / base) * 100;
+    return { value, pct, positive: value >= 0 };
+  }, [baselineCounts]);
+
+  async function createNoteSnapshot() {
+    const text = noteText.trim();
+    if (!text) return;
+    if (!notesApiReady) {
+      setNoteErr("Launch notes are not available yet. Deploy API routes and run DB migrations first.");
+      return;
+    }
+    try {
+      setNotesBusy(true);
+      setNoteErr(null);
+      const response = await fetch(`${API_BASE}/health-notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scope: "health",
+          noteText: text,
+          label: noteLabel,
+          createdBy: "web",
+        }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await loadNotes();
+      setNoteText("");
+      setNoteLabel("feature_launch");
+      setShowCreateNote(false);
+      setNoteMsg("Baseline snapshot saved");
+      setTimeout(() => setNoteMsg(null), 2500);
+    } catch (e) {
+      console.error("Failed to create note snapshot", e);
+      setNoteErr("Failed to save note snapshot");
+    } finally {
+      setNotesBusy(false);
+    }
+  }
+
+  async function deleteSelectedNote() {
+    if (!selectedNoteId) return;
+    if (!notesApiReady) return;
+    if (!confirm("Delete selected baseline note?")) return;
+
+    try {
+      setNotesBusy(true);
+      setNoteErr(null);
+      const response = await fetch(`${API_BASE}/health-notes?id=${encodeURIComponent(selectedNoteId)}&scope=health`, {
+        method: "DELETE",
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (selectedNoteId === selectedNote?.id) setSelectedNoteId(null);
+      await loadNotes();
+      setNoteMsg("Baseline note deleted");
+      setTimeout(() => setNoteMsg(null), 2500);
+    } catch (e) {
+      console.error("Failed to delete note snapshot", e);
+      setNoteErr("Failed to delete note");
+    } finally {
+      setNotesBusy(false);
+    }
+  }
 
   // Filtered + sorted
   const filtered = useMemo(() => {
@@ -317,8 +445,30 @@ export default function HealthIndexPage() {
           <h1 style={{ fontSize: 20, fontWeight: 600, color: "#fff", letterSpacing: "-0.3px", margin: 0 }}>Customer Health Index</h1>
           <p style={{ fontSize: 13, color: "#666", marginTop: 4 }}>Patients with an active treatment plan <em style={{ fontStyle: "normal", color: "#444" }}>and</em> at least one shop visit — adherence × engagement</p>
           <p style={{ fontSize: 11, color: "#444", marginTop: 3 }}>Scope: shop-engaged cohort only · full patient base of 25,698 in <Link href="/" style={{ color: "#555", textDecoration: "underline" }}>Reconciliation</Link></p>
+          {selectedNote && (
+            <p style={{ fontSize: 11, color: "#60a5fa", marginTop: 6 }}>
+              Baseline: {new Date(selectedNote.createdAt).toLocaleString()} · {selectedNote.noteText}
+            </p>
+          )}
+          {noteMsg && <p style={{ fontSize: 11, color: "#4ade80", marginTop: 6 }}>{noteMsg}</p>}
+          {noteErr && <p style={{ fontSize: 11, color: "#f87171", marginTop: 6 }}>{noteErr}</p>}
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            onClick={() => setShowCreateNote(true)}
+            disabled={!notesApiReady || notesBusy}
+            style={{
+              ...ghostBtn,
+              borderColor: notesApiReady ? "#1d4ed8" : "#2a2a2a",
+              color: notesApiReady ? "#bfdbfe" : "#555",
+              background: notesApiReady ? "#0f172a" : "#1a1a1a",
+              cursor: !notesApiReady || notesBusy ? "not-allowed" : "pointer",
+            }}
+          >
+            + Create Note Snapshot
+          </button>
+          <button onClick={() => setSelectedNoteId(null)} disabled={!selectedNoteId || notesBusy} style={ghostBtn}>Clear Baseline</button>
+          <button onClick={deleteSelectedNote} disabled={!selectedNoteId || notesBusy} style={{ ...ghostBtn, borderColor: "#7f1d1d", color: "#fecaca", background: "#1f1010" }}>Delete Baseline</button>
           <button onClick={() => load()} disabled={loading} style={ghostBtn}>⟳ Refresh</button>
           {/* <a href={`${API_BASE}/health-data/export?group=noplan`} style={ghostBtn as React.AnchorHTMLAttributes<HTMLAnchorElement>["style"]}>↓ No Plan CSV</a> */}
           <a href={`${API_BASE}/health-data/export`} style={ghostBtn as React.AnchorHTMLAttributes<HTMLAnchorElement>["style"]}>↓ All CSV</a>
@@ -331,6 +481,7 @@ export default function HealthIndexPage() {
           <GroupChip
             key={g.key} color={g.color} count={groupCounts[g.key] ?? 0}
             label={g.label}
+            delta={fmtDelta(g.key, groupCounts[g.key] ?? 0)}
             active={filterGroup === g.key}
             onClick={() => {
               const nextGroup = filterGroup === g.key ? "" : g.key;
@@ -374,6 +525,39 @@ export default function HealthIndexPage() {
           ))}
         </div>
       )}
+
+      <div style={{ padding: "12px 32px", borderBottom: "1px solid #1a1a1a", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <span style={{ fontSize: 12, color: "#555" }}>Launch Notes:</span>
+        {!notesApiReady && (
+          <span style={{ fontSize: 12, color: "#666" }}>
+            Launch notes unavailable in this environment (missing route or migration).
+          </span>
+        )}
+        {notesBusy && <span style={{ fontSize: 12, color: "#555" }}>Loading…</span>}
+        {!notesBusy && notesApiReady && notes.length === 0 && <span style={{ fontSize: 12, color: "#444" }}>No snapshots yet. Create one before/after feature changes.</span>}
+        {notes.map((note) => (
+          <button
+            key={note.id}
+            onClick={() => setSelectedNoteId((current) => (current === note.id ? null : note.id))}
+            style={{
+              background: selectedNoteId === note.id ? "#1e293b" : "#1a1a1a",
+              border: `1px solid ${selectedNoteId === note.id ? "#2563eb" : "#2a2a2a"}`,
+              color: selectedNoteId === note.id ? "#dbeafe" : "#aaa",
+              borderRadius: 999,
+              padding: "6px 10px",
+              fontSize: 12,
+              cursor: "pointer",
+              maxWidth: 360,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+            title={`${new Date(note.createdAt).toLocaleString()} · ${note.noteText}`}
+          >
+            {new Date(note.createdAt).toLocaleDateString()} · {(note.label ?? "note").replace(/_/g, " ")} · {note.noteText}
+          </button>
+        ))}
+      </div>
 
       {/* ── Controls ── */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 32px", borderBottom: "1px solid #1a1a1a", flexWrap: "wrap" }}>
@@ -529,6 +713,75 @@ export default function HealthIndexPage() {
           </div>
         </>
       )}
+
+      {showCreateNote && (
+        <>
+          <div onClick={() => setShowCreateNote(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 200 }} />
+          <div style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 201,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}>
+            <div style={{ width: "100%", maxWidth: 560, background: "#141414", border: "1px solid #2a2a2a", borderRadius: 10, padding: 20 }}>
+              <h3 style={{ margin: 0, color: "#fff", fontSize: 18 }}>Create Note Snapshot</h3>
+              <p style={{ margin: "6px 0 14px", color: "#666", fontSize: 12 }}>
+                This will save a baseline of current cohort counts and criteria so you can compare future movement.
+              </p>
+              <label style={{ display: "block", color: "#888", fontSize: 12, marginBottom: 6 }}>Note</label>
+              <textarea
+                value={noteText}
+                onChange={(e) => setNoteText(e.target.value.slice(0, 500))}
+                placeholder="Example: Shop navigation redesign launched at 8:00am"
+                style={{
+                  width: "100%",
+                  minHeight: 96,
+                  background: "#101010",
+                  color: "#eee",
+                  border: "1px solid #2a2a2a",
+                  borderRadius: 8,
+                  padding: 10,
+                  resize: "vertical",
+                  outline: "none",
+                  fontSize: 13,
+                }}
+              />
+              <div style={{ marginTop: 10, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <label style={{ color: "#888", fontSize: 12 }}>Label</label>
+                  <select value={noteLabel} onChange={(e) => setNoteLabel(e.target.value)} style={selectStyle}>
+                    <option value="feature_launch">Feature launch</option>
+                    <option value="shop_redesign">Shop redesign</option>
+                    <option value="email_campaign">Email campaign</option>
+                    <option value="price_change">Price change</option>
+                    <option value="other">Other</option>
+                  </select>
+                </div>
+                <span style={{ fontSize: 11, color: "#555" }}>{noteText.length}/500</span>
+              </div>
+              <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+                <button onClick={() => setShowCreateNote(false)} style={ghostBtn}>Cancel</button>
+                <button
+                  onClick={createNoteSnapshot}
+                  disabled={!noteText.trim() || allRows.length === 0}
+                  style={{
+                    ...ghostBtn,
+                    background: !noteText.trim() || allRows.length === 0 ? "#1a1a1a" : "#1d4ed8",
+                    color: !noteText.trim() || allRows.length === 0 ? "#555" : "#fff",
+                    borderColor: !noteText.trim() || allRows.length === 0 ? "#2a2a2a" : "#2563eb",
+                    cursor: !noteText.trim() || allRows.length === 0 ? "not-allowed" : "pointer",
+                  }}
+                >
+                  Save Baseline Snapshot
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -630,8 +883,13 @@ function DetailCharts({ detail }: { detail: DetailData }) {
 }
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
-function GroupChip({ color, count, label, active, onClick }: {
-  color: string; count: number; label: string; active: boolean; onClick: () => void;
+function GroupChip({ color, count, label, active, onClick, delta }: {
+  color: string;
+  count: number;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  delta?: { value: number; pct: number; positive: boolean } | null;
 }) {
   return (
     <div onClick={onClick}
@@ -643,6 +901,16 @@ function GroupChip({ color, count, label, active, onClick }: {
       <span style={{ width: 8, height: 8, borderRadius: "50%", background: color, flexShrink: 0 }} />
       <span style={{ fontWeight: 600, color: "#fff" }}>{count.toLocaleString()}</span>
       <span style={{ color: active ? "#aaa" : "#666" }}>{label}</span>
+      {delta && (
+        <span style={{
+          marginLeft: 4,
+          fontSize: 11,
+          color: delta.positive ? "#4ade80" : "#f87171",
+          fontVariantNumeric: "tabular-nums",
+        }}>
+          {delta.value > 0 ? "+" : ""}{delta.value} ({delta.pct.toFixed(1)}%)
+        </span>
+      )}
     </div>
   );
 }

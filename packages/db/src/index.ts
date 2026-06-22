@@ -20,6 +20,7 @@ import * as pagesSchema from "./schema/pages";
 import * as rolesSchema from "./schema/roles";
 import * as rolePagesSchema from "./schema/role-pages";
 import * as usersSchema from "./schema/users";
+import * as healthNotesSchema from "./schema/health-notes";
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
@@ -52,6 +53,7 @@ const schema = {
   ...rolesSchema,
   ...rolePagesSchema,
   ...usersSchema,
+  ...healthNotesSchema,
 };
 
 export const db = drizzle(client, { schema });
@@ -75,3 +77,4 @@ export * from "./schema/pages";
 export * from "./schema/roles";
 export * from "./schema/role-pages";
 export * from "./schema/users";
+export * from "./schema/health-notes";

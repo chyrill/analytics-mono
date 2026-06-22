@@ -148,6 +148,10 @@ async function fetchOrdersDispatched(): Promise<OrderRow[]> {
 
 const BATCH = 500;
 
+type DocAppSyncOptions = {
+  fullRefresh?: boolean;
+};
+
 export const handler: ScheduledHandler = async (_event) => {
   console.log("[docapp-sync] starting");
   const runStart = new Date();
@@ -390,8 +394,10 @@ interface DocAppTreatmentPlan {
 async function syncDocPatients(
   conn: Sql,
   jobId: string,
+  options?: DocAppSyncOptions,
 ): Promise<{ fetched: number; upserted: number }> {
-  const since = await getCheckpoint("docapp", "patients");
+  const fullRefresh = options?.fullRefresh === true;
+  const since = fullRefresh ? null : await getCheckpoint("docapp", "patients");
   const syncedAt = new Date();
 
   let rows: DocAppPatientFull[];
@@ -531,8 +537,10 @@ async function syncDocPatients(
 async function syncDocTreatmentPlans(
   conn: Sql,
   jobId: string,
+  options?: DocAppSyncOptions,
 ): Promise<{ fetched: number; upserted: number }> {
-  const since = await getCheckpoint("docapp", "treatment_plans");
+  const fullRefresh = options?.fullRefresh === true;
+  const since = fullRefresh ? null : await getCheckpoint("docapp", "treatment_plans");
   const syncedAt = new Date();
 
   let rows: DocAppTreatmentPlan[];
@@ -749,8 +757,10 @@ interface TreatmentPlanTrackerRow {
 async function syncDocTreatmentPlanTracker(
   conn: Sql,
   jobId: string,
+  options?: DocAppSyncOptions,
 ): Promise<{ fetched: number; upserted: number }> {
-  const since = await getCheckpoint("docapp", "treatment_plan_tracker");
+  const fullRefresh = options?.fullRefresh === true;
+  const since = fullRefresh ? null : await getCheckpoint("docapp", "treatment_plan_tracker");
   const syncedAt = new Date();
 
   let rows: TreatmentPlanTrackerRow[];
@@ -904,26 +914,33 @@ async function syncDocTreatmentPlanTracker(
 
 // ── runDocAppSync — entry point for /sync/docapp API route ───────────────────
 
-export async function runDocAppSync(jobId: string): Promise<{ fetched: number; upserted: number }> {
+export async function runDocAppSync(
+  jobId: string,
+  options?: DocAppSyncOptions,
+): Promise<{ fetched: number; upserted: number }> {
   const conn = postgres(process.env.DOCAPP_DATABASE_URL ?? "", {
     ssl: "require",
     max: 5,
   });
   if (!process.env.DOCAPP_DATABASE_URL) throw new Error("DOCAPP_DATABASE_URL not set");
 
+  if (options?.fullRefresh) {
+    console.log("[docapp-sync] full refresh requested for this run (checkpoint bypass enabled)");
+  }
+
   try {
     let totalFetched = 0;
     let totalUpserted = 0;
 
-    const p = await syncDocPatients(conn, jobId);
+    const p = await syncDocPatients(conn, jobId, options);
     totalFetched += p.fetched;
     totalUpserted += p.upserted;
 
-    const t = await syncDocTreatmentPlans(conn, jobId);
+    const t = await syncDocTreatmentPlans(conn, jobId, options);
     totalFetched += t.fetched;
     totalUpserted += t.upserted;
 
-    const tr = await syncDocTreatmentPlanTracker(conn, jobId);
+    const tr = await syncDocTreatmentPlanTracker(conn, jobId, options);
     totalFetched += tr.fetched;
     totalUpserted += tr.upserted;
 

@@ -1,6 +1,6 @@
 import type { APIGatewayProxyHandlerV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
-import { db } from "@analytics/db";
-import { sql } from "drizzle-orm";
+import { db, healthNotes, healthSnapshots } from "@analytics/db";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -70,6 +70,15 @@ function ok(body: unknown, status = 200): APIGatewayProxyStructuredResultV2 {
 }
 function err(msg: string, status = 400): APIGatewayProxyStructuredResultV2 {
   return { statusCode: status, headers: CORS, body: JSON.stringify({ error: msg }) };
+}
+
+function buildSnapshotPayload(rows: RawHealthRow[], criteriaCountsByGroup: Record<string, Record<string, number>>) {
+  const cohortCounts: Record<string, number> = { purple: 0, green: 0, orange: 0, red: 0 };
+  for (const row of rows) {
+    const group = row.adherence_group;
+    if (group && cohortCounts[group] != null) cohortCounts[group] += 1;
+  }
+  return { cohortCounts, criteriaBreakdown: criteriaCountsByGroup };
 }
 
 function buildHealthQuery(from?: string | null, to?: string | null) {
@@ -227,13 +236,13 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     ROUND(at.allotted_g, 1)                                               AS allotted_g,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS bought_g,
     ROUND(at.avg_remaining_g, 1)                                          AS avg_remaining_g,
-    ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) AS adherence_pct,
+    ROUND(COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) * 100, 1) AS adherence_pct,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
     at.avg_allotted_g,
     COALESCE(lo.last_order_date, se.last_visit)                            AS last_activity_date,
     (
-      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
-      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) < 25
+      COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) IS NOT NULL
+      AND ROUND(COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) * 100, 1) < 25
     )                                                                      AS is_red_low_grams,
     (
       COALESCE(lo.last_order_date, se.last_visit) IS NULL
@@ -244,8 +253,8 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       AND tpt.script_expiration_date::date < CURRENT_DATE - INTERVAL '60 days'
     )                                                                      AS is_red_consultation_overdue_60,
     (
-      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
-      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 25 AND 50
+      COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) IS NOT NULL
+      AND ROUND(COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) * 100, 1) BETWEEN 25 AND 50
     )                                                                      AS is_orange_grams_25_50,
     (
       COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '45 days'
@@ -259,8 +268,8 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       )
     )                                                                      AS is_orange_consultation_due,
     (
-      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
-      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 75 AND 110
+      COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) IS NOT NULL
+      AND ROUND(COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) * 100, 1) BETWEEN 75 AND 110
     )                                                                      AS is_purple_grams_75_110,
     (
       COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '30 days'
@@ -271,8 +280,8 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE)
     )                                                                      AS is_purple_consultation_current,
     (
-      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
-      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 50 AND 75
+      COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) IS NOT NULL
+      AND ROUND(COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) * 100, 1) BETWEEN 50 AND 75
     )                                                                      AS is_green_grams_50_75,
     (
       COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '45 days'
@@ -283,14 +292,14 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     )                                                                      AS is_green_consultation_current,
     CASE
       -- No supply plan
-      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
+      WHEN COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) IS NULL
         AND zc.supply_date IS NOT NULL THEN 'red'
-      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL THEN NULL
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
+      WHEN COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) IS NULL THEN NULL
+       WHEN COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) >= 0.75
          AND COALESCE(at.repeat_count, 0) >= 3
          AND COALESCE(se.purchase_rate_pct, 100) >= 60 THEN 'purple'
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.50 THEN 'green'
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.25 THEN 'orange'
+       WHEN COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) >= 0.50 THEN 'green'
+       WHEN COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) >= 0.25 THEN 'orange'
       ELSE 'red'
     END                                                                    AS adherence_group,
     se.total_visits, se.total_purchases, se.purchase_rate_pct,
@@ -308,20 +317,20 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
       ELSE NULL
     END AS conversion_tier,
     CASE
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
+       WHEN COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) >= 0.75
            AND se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60 THEN 'loyal_power_buyer'
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75 THEN 'high_adherent'
+       WHEN COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) >= 0.75 THEN 'high_adherent'
       WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60
          AND (
-           COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
-           OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.75
+           COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) IS NULL
+           OR COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) < 0.75
          ) THEN 'active_partial_buyer'
       WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 'window_shopper'
       WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 'casual_buyer'
       WHEN (se.avg_visits_per_month < 1 OR se.avg_visits_per_month IS NULL)
          AND (
-           COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
-           OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.25
+           COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) IS NULL
+           OR COALESCE(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0), ac.adherence_ratio) < 0.25
          ) THEN 'at_risk'
       ELSE 'needs_review'
     END AS customer_pattern,
@@ -351,6 +360,12 @@ ORDER BY
 export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatewayProxyStructuredResultV2> => {
   const routeKey = event.routeKey ?? "";
   const qs = event.queryStringParameters ?? {};
+  let body: Record<string, unknown> = {};
+  try {
+    body = event.body ? JSON.parse(event.body) : {};
+  } catch {
+    body = {};
+  }
 
   try {
     // GET /health-data
@@ -358,6 +373,104 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
       const rows = toRows<RawHealthRow>(await db.execute(buildHealthQuery(qs.from, qs.to)));
       const enriched = enrichHealthRows(rows);
       return ok({ rows: enriched.rows, count: enriched.rows.length, criteriaCountsByGroup: enriched.criteriaCountsByGroup });
+    }
+
+    // GET /health-notes
+    if (routeKey === "GET /health-notes") {
+      const scope = (qs.scope ?? "health").toString().trim() || "health";
+      const rows = await db
+        .select({
+          id: healthNotes.id,
+          noteText: healthNotes.noteText,
+          label: healthNotes.label,
+          createdBy: healthNotes.createdBy,
+          createdAt: healthNotes.createdAt,
+          snapshotId: healthNotes.snapshotId,
+          snapshotAt: healthSnapshots.snapshotAt,
+          cohortCounts: healthSnapshots.cohortCounts,
+          criteriaBreakdown: healthSnapshots.criteriaBreakdown,
+        })
+        .from(healthNotes)
+        .innerJoin(healthSnapshots, eq(healthNotes.snapshotId, healthSnapshots.id))
+        .where(and(eq(healthNotes.scope, scope), isNull(healthNotes.deletedAt)))
+        .orderBy(desc(healthNotes.createdAt))
+        .limit(30);
+
+      return ok({ notes: rows });
+    }
+
+    // POST /health-notes
+    if (routeKey === "POST /health-notes") {
+      const noteText = (body.noteText ?? "").toString().trim();
+      const label = (body.label ?? "").toString().trim() || null;
+      const scope = (body.scope ?? "health").toString().trim() || "health";
+      const createdBy = (body.createdBy ?? "").toString().trim() || null;
+
+      if (!noteText) return err("noteText is required", 400);
+      if (noteText.length > 500) return err("noteText must be <= 500 chars", 400);
+
+      const rawRows = toRows<RawHealthRow>(await db.execute(buildHealthQuery(null, null)));
+      const enriched = enrichHealthRows(rawRows);
+      const snapshot = buildSnapshotPayload(rawRows, enriched.criteriaCountsByGroup);
+
+      const inserted = await db.transaction(async (tx) => {
+        const [snapshotRow] = await tx
+          .insert(healthSnapshots)
+          .values({
+            scope,
+            cohortCounts: snapshot.cohortCounts,
+            criteriaBreakdown: snapshot.criteriaBreakdown,
+          })
+          .returning({
+            id: healthSnapshots.id,
+            snapshotAt: healthSnapshots.snapshotAt,
+            cohortCounts: healthSnapshots.cohortCounts,
+            criteriaBreakdown: healthSnapshots.criteriaBreakdown,
+          });
+
+        const [noteRow] = await tx
+          .insert(healthNotes)
+          .values({
+            scope,
+            noteText,
+            label,
+            createdBy,
+            snapshotId: snapshotRow.id,
+          })
+          .returning({
+            id: healthNotes.id,
+            noteText: healthNotes.noteText,
+            label: healthNotes.label,
+            createdBy: healthNotes.createdBy,
+            createdAt: healthNotes.createdAt,
+          });
+
+        return {
+          ...noteRow,
+          snapshotId: snapshotRow.id,
+          snapshotAt: snapshotRow.snapshotAt,
+          cohortCounts: snapshotRow.cohortCounts,
+          criteriaBreakdown: snapshotRow.criteriaBreakdown,
+        };
+      });
+
+      return ok({ note: inserted }, 201);
+    }
+
+    // DELETE /health-notes?id=<noteId>&scope=health
+    if (routeKey === "DELETE /health-notes") {
+      const id = (qs.id ?? "").toString().trim();
+      const scope = (qs.scope ?? "health").toString().trim() || "health";
+      if (!id) return err("id is required", 400);
+
+      const updated = await db
+        .update(healthNotes)
+        .set({ deletedAt: sql`now()` })
+        .where(and(eq(healthNotes.id, id), eq(healthNotes.scope, scope), isNull(healthNotes.deletedAt)))
+        .returning({ id: healthNotes.id });
+
+      if (!updated.length) return err("Note not found", 404);
+      return ok({ ok: true, id });
     }
 
     // GET /health-data/export

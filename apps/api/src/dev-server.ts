@@ -113,6 +113,9 @@ const invokeHealth = (req: Request, res: Response) =>
 app.get("/health-data", invokeHealth);
 app.get("/health-data/export", invokeHealth);
 app.get("/health-detail", invokeHealth);
+app.get("/health-notes", invokeHealth);
+app.post("/health-notes", invokeHealth);
+app.delete("/health-notes", invokeHealth);
 
 // ── Sync helpers ──────────────────────────────────────────────────────────────
 
@@ -203,6 +206,9 @@ app.post("/sync/saleor", async (_req, res) => {
 // ── POST /sync/db ─────────────────────────────────────────────────────────────
 
 app.post("/sync/db", async (_req, res) => {
+  const fullRefresh = String(_req.query.fullRefresh ?? "").toLowerCase();
+  const forceFullRefresh = fullRefresh === "1" || fullRefresh === "true";
+
   const inProgress = await checkInProgress("db");
   if (inProgress) {
     res.status(409).json({ error: "sync_in_progress", job_id: inProgress.id, started_at: inProgress.startedAt });
@@ -218,7 +224,13 @@ app.post("/sync/db", async (_req, res) => {
     return;
   }
 
-  res.status(202).json({ job_id: job.id, source: "db", job_type: "full", status: "started" });
+  res.status(202).json({
+    job_id: job.id,
+    source: "db",
+    job_type: "full",
+    full_refresh: forceFullRefresh,
+    status: "started",
+  });
 
   db.execute(sql`
     UPDATE customers
@@ -232,7 +244,7 @@ app.post("/sync/db", async (_req, res) => {
     END,
     updated_at = now()
   `)
-    .then(() => runDocAppSync(job.id))
+    .then(() => runDocAppSync(job.id, { fullRefresh: forceFullRefresh }))
     .then(({ fetched, upserted }) =>
       db.update(syncJobs).set({
         status: "completed",
@@ -250,6 +262,9 @@ app.post("/sync/db", async (_req, res) => {
 // ── POST /sync/docapp ─────────────────────────────────────────────────────────
 
 app.post("/sync/docapp", async (_req, res) => {
+  const fullRefresh = String(_req.query.fullRefresh ?? "").toLowerCase();
+  const forceFullRefresh = fullRefresh === "1" || fullRefresh === "true";
+
   const inProgress = await checkInProgress("docapp");
   if (inProgress) {
     res.status(409).json({ error: "sync_in_progress", job_id: inProgress.id, started_at: inProgress.startedAt });
@@ -259,7 +274,7 @@ app.post("/sync/docapp", async (_req, res) => {
   const patientsCheckpoint = await db.select().from(syncCheckpoints)
     .where(and(eq(syncCheckpoints.source, "docapp"), eq(syncCheckpoints.entity, "patients")))
     .limit(1);
-  const jobType = patientsCheckpoint.length > 0 ? "incremental" : "full";
+  const jobType = forceFullRefresh ? "full" : (patientsCheckpoint.length > 0 ? "incremental" : "full");
 
   const [job] = await db.insert(syncJobs).values({
     source: "docapp",
@@ -274,9 +289,15 @@ app.post("/sync/docapp", async (_req, res) => {
     return;
   }
 
-  res.status(202).json({ job_id: job.id, source: "docapp", job_type: jobType, status: "started" });
+  res.status(202).json({
+    job_id: job.id,
+    source: "docapp",
+    job_type: jobType,
+    full_refresh: forceFullRefresh,
+    status: "started",
+  });
 
-  runDocAppSync(job.id)
+  runDocAppSync(job.id, { fullRefresh: forceFullRefresh })
     .then(({ fetched, upserted }) =>
       db.update(syncJobs).set({ status: "completed", recordsFetched: fetched, recordsUpserted: upserted, completedAt: new Date() })
         .where(eq(syncJobs.id, job.id)),
