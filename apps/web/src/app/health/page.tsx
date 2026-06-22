@@ -55,6 +55,22 @@ interface GroupChipConfig {
   criteria: GroupCriterion[];
 }
 
+type FieldType = "string" | "number" | "date";
+type FilterOperator = "eq" | "neq" | "contains" | "not_contains" | "gt" | "gte" | "lt" | "lte" | "before" | "after" | "on_or_before" | "on_or_after" | "is_empty" | "not_empty";
+
+interface AdvancedFilter {
+  id: number;
+  field: keyof HealthRow;
+  op: FilterOperator;
+  value: string;
+}
+
+interface FieldOption {
+  key: keyof HealthRow;
+  label: string;
+  type: FieldType;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function fmt(v: number | string | null, decimals = 1): string {
   if (v == null || v === "") return "—";
@@ -154,6 +170,115 @@ const GROUP_CHIPS: GroupChipConfig[] = [
   // { key: "__none", color: "#444", label: "No plan", tip: "No active treatment plan on file.\nSaleor-only customers or patients without a current prescription." },
 ];
 
+const ADVANCED_FIELDS: FieldOption[] = [
+  { key: "patient_name", label: "Patient", type: "string" },
+  { key: "email", label: "Email", type: "string" },
+  { key: "adherence_group", label: "Group", type: "string" },
+  { key: "adherence_pct", label: "Adherence %", type: "number" },
+  { key: "allotted_g", label: "Allotted (g)", type: "number" },
+  { key: "bought_g", label: "Bought (g)", type: "number" },
+  { key: "repeat_count", label: "Repeats", type: "number" },
+  { key: "repeats_remaining", label: "Rem Rep", type: "number" },
+  { key: "total_visits", label: "Visits", type: "number" },
+  { key: "avg_visits_per_month", label: "Vis/mo", type: "number" },
+  { key: "avg_days_between_visits", label: "Avg Days", type: "number" },
+  { key: "visit_tier", label: "Visit Tier", type: "string" },
+  { key: "last_visit", label: "Last Visit", type: "date" },
+  { key: "script_end_date", label: "Script End Date", type: "date" },
+  { key: "customer_pattern", label: "Pattern", type: "string" },
+];
+
+const OPS_BY_TYPE: Record<FieldType, Array<{ value: FilterOperator; label: string }>> = {
+  string: [
+    { value: "contains", label: "contains" },
+    { value: "not_contains", label: "does not contain" },
+    { value: "eq", label: "equals" },
+    { value: "neq", label: "not equal" },
+    { value: "is_empty", label: "is empty" },
+    { value: "not_empty", label: "is not empty" },
+  ],
+  number: [
+    { value: "eq", label: "=" },
+    { value: "neq", label: "!=" },
+    { value: "gt", label: ">" },
+    { value: "gte", label: ">=" },
+    { value: "lt", label: "<" },
+    { value: "lte", label: "<=" },
+    { value: "is_empty", label: "is empty" },
+    { value: "not_empty", label: "is not empty" },
+  ],
+  date: [
+    { value: "eq", label: "on" },
+    { value: "before", label: "before" },
+    { value: "on_or_before", label: "on or before" },
+    { value: "after", label: "after" },
+    { value: "on_or_after", label: "on or after" },
+    { value: "is_empty", label: "is empty" },
+    { value: "not_empty", label: "is not empty" },
+  ],
+};
+
+function parseDateValue(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  const s = String(v).slice(0, 10);
+  const ms = Date.parse(`${s}T00:00:00.000Z`);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function parseNumberValue(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  const n = parseFloat(String(v));
+  return Number.isNaN(n) ? null : n;
+}
+
+function getFieldOption(field: keyof HealthRow): FieldOption {
+  return ADVANCED_FIELDS.find((f) => f.key === field) ?? { key: field, label: String(field), type: "string" };
+}
+
+function matchesAdvancedFilter(row: HealthRow, filter: AdvancedFilter): boolean {
+  const fieldMeta = getFieldOption(filter.field);
+  const raw = row[filter.field] as unknown;
+
+  if (filter.op === "is_empty") return raw == null || String(raw).trim() === "";
+  if (filter.op === "not_empty") return raw != null && String(raw).trim() !== "";
+
+  if (!filter.value.trim()) return true;
+
+  if (fieldMeta.type === "number") {
+    const left = parseNumberValue(raw);
+    const right = parseNumberValue(filter.value);
+    if (left == null || right == null) return false;
+    if (filter.op === "eq") return left === right;
+    if (filter.op === "neq") return left !== right;
+    if (filter.op === "gt") return left > right;
+    if (filter.op === "gte") return left >= right;
+    if (filter.op === "lt") return left < right;
+    if (filter.op === "lte") return left <= right;
+    return false;
+  }
+
+  if (fieldMeta.type === "date") {
+    const left = parseDateValue(raw);
+    const right = parseDateValue(filter.value);
+    if (left == null || right == null) return false;
+    if (filter.op === "eq") return left === right;
+    if (filter.op === "before") return left < right;
+    if (filter.op === "on_or_before") return left <= right;
+    if (filter.op === "after") return left > right;
+    if (filter.op === "on_or_after") return left >= right;
+    if (filter.op === "neq") return left !== right;
+    return false;
+  }
+
+  const left = String(raw ?? "").toLowerCase();
+  const right = filter.value.toLowerCase();
+  if (filter.op === "contains") return left.includes(right);
+  if (filter.op === "not_contains") return !left.includes(right);
+  if (filter.op === "eq") return left === right;
+  if (filter.op === "neq") return left !== right;
+  return false;
+}
+
 // ── Chart drawing ──────────────────────────────────────────────────────────────
 declare const Chart: {
   new(ctx: CanvasRenderingContext2D, config: Record<string, unknown>): { destroy(): void };
@@ -190,6 +315,8 @@ export default function HealthIndexPage() {
   const [period, setPeriod] = useState<"all" | "4m" | "custom">("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const [advancedFilters, setAdvancedFilters] = useState<AdvancedFilter[]>([]);
+  const [nextFilterId, setNextFilterId] = useState(1);
 
   function load(overridePeriod?: "all" | "4m" | "custom", overrideFrom?: string, overrideTo?: string) {
     const activePeriod = overridePeriod ?? period;
@@ -290,6 +417,7 @@ export default function HealthIndexPage() {
         }
         if (filterCriterion && !(r.matched_criteria ?? []).includes(filterCriterion)) return false;
         if (hideNoplan && r.adherence_group == null) return false;
+        if (advancedFilters.length > 0 && !advancedFilters.every((f) => matchesAdvancedFilter(r, f))) return false;
         return true;
       })
       .sort((a, b) => {
@@ -299,7 +427,34 @@ export default function HealthIndexPage() {
         if (av == null) return 1; if (bv == null) return -1;
         return av < bv ? sortDir : av > bv ? -sortDir : 0;
       });
-  }, [allRows, search, filterPattern, filterGroup, filterCriterion, hideNoplan, sortCol, sortDir]);
+  }, [allRows, search, filterPattern, filterGroup, filterCriterion, hideNoplan, advancedFilters, sortCol, sortDir]);
+
+  function addAdvancedFilter() {
+    const defaultField = ADVANCED_FIELDS[0];
+    const defaultOp = OPS_BY_TYPE[defaultField.type][0]?.value ?? "contains";
+    setAdvancedFilters((curr) => [...curr, { id: nextFilterId, field: defaultField.key, op: defaultOp, value: "" }]);
+    setNextFilterId((n) => n + 1);
+    setPage(1);
+  }
+
+  function removeAdvancedFilter(id: number) {
+    setAdvancedFilters((curr) => curr.filter((f) => f.id !== id));
+    setPage(1);
+  }
+
+  function updateAdvancedFilter(id: number, patch: Partial<AdvancedFilter>) {
+    setAdvancedFilters((curr) => curr.map((f) => {
+      if (f.id !== id) return f;
+      const updated: AdvancedFilter = { ...f, ...patch };
+      if (patch.field) {
+        const fieldMeta = getFieldOption(patch.field);
+        updated.op = OPS_BY_TYPE[fieldMeta.type][0]?.value ?? updated.op;
+        updated.value = "";
+      }
+      return updated;
+    }));
+    setPage(1);
+  }
 
   const selectedGroupConfig = useMemo(
     () => GROUP_CHIPS.find((group) => group.key === filterGroup) ?? null,
@@ -416,6 +571,41 @@ export default function HealthIndexPage() {
             ? `${filtered.length.toLocaleString()} of ${allRows.length.toLocaleString()}`
             : `${allRows.length.toLocaleString()} patients`}
         </span>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "12px 32px", borderBottom: "1px solid #1a1a1a" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 12, color: "#777", fontWeight: 600, letterSpacing: "0.2px" }}>Advanced Filters</span>
+          <button onClick={addAdvancedFilter} style={ghostBtn}>+ Add Filter</button>
+          {advancedFilters.length > 0 && (
+            <button onClick={() => { setAdvancedFilters([]); setPage(1); }} style={ghostBtn}>Clear</button>
+          )}
+        </div>
+        {advancedFilters.map((f) => {
+          const meta = getFieldOption(f.field);
+          const ops = OPS_BY_TYPE[meta.type];
+          const showValue = f.op !== "is_empty" && f.op !== "not_empty";
+          return (
+            <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <select value={f.field} onChange={(e) => updateAdvancedFilter(f.id, { field: e.target.value as keyof HealthRow })} style={selectStyle}>
+                {ADVANCED_FIELDS.map((opt) => <option key={opt.key} value={opt.key}>{opt.label}</option>)}
+              </select>
+              <select value={f.op} onChange={(e) => updateAdvancedFilter(f.id, { op: e.target.value as FilterOperator })} style={selectStyle}>
+                {ops.map((op) => <option key={op.value} value={op.value}>{op.label}</option>)}
+              </select>
+              {showValue && (
+                <input
+                  type={meta.type === "date" ? "date" : meta.type === "number" ? "number" : "text"}
+                  value={f.value}
+                  onChange={(e) => updateAdvancedFilter(f.id, { value: e.target.value })}
+                  placeholder={meta.type === "date" ? "Select date" : "Value"}
+                  style={{ ...searchInput, width: meta.type === "string" ? 220 : 180 }}
+                />
+              )}
+              <button onClick={() => removeAdvancedFilter(f.id)} style={{ ...ghostBtn, color: "#f87171", borderColor: "#3a2323" }}>Remove</button>
+            </div>
+          );
+        })}
       </div>
 
       {/* ── Table ── */}
