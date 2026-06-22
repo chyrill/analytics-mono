@@ -26,7 +26,7 @@ interface HealthRow {
   visit_tier: string | null;
   conversion_tier: string | null;
   last_visit: string | null;
-  signed_up: string | null;
+  script_end_date: string | null;
 }
 
 interface DetailData {
@@ -60,6 +60,22 @@ function fmt(v: number | string | null, decimals = 1): string {
   if (v == null || v === "") return "—";
   const n = parseFloat(String(v));
   return isNaN(n) ? String(v) : n.toFixed(decimals);
+}
+
+function fmtWhole(v: number | string | null): string {
+  if (v == null || v === "") return "—";
+  const n = parseFloat(String(v));
+  return isNaN(n) ? String(v) : String(Math.round(n));
+}
+
+function isExpiredUtc(dateStr: string | null): boolean {
+  if (!dateStr) return false;
+  const yyyyMmDd = String(dateStr).slice(0, 10);
+  const d = new Date(`${yyyyMmDd}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) return false;
+  const now = new Date();
+  const utcToday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  return d.getTime() <= utcToday.getTime();
 }
 
 const PATTERN_LABEL: Record<string, string> = {
@@ -417,17 +433,14 @@ export default function HealthIndexPage() {
                   ["adherence_pct", "Adherence %"],
                   ["allotted_g", "Allotted (g)"],
                   ["bought_g", "Bought (g)"],
-                  ["avg_remaining_g", "Avg rem (g)"],
                   ["repeat_count", "Repeats"],
                   ["repeats_remaining", "Rem rep"],
                   ["total_visits", "Visits"],
-                  ["purchase_rate_pct", "Conv %"],
                   ["avg_visits_per_month", "Vis/mo"],
                   ["avg_days_between_visits", "Avg days"],
                   ["visit_tier", "Visit tier"],
-                  ["conversion_tier", "Conv tier"],
                   ["last_visit", "Last visit"],
-                  ["signed_up", "Signed up"],
+                  ["script_end_date", "Script end date"],
                 ] as [string, string][]).map(([col, label]) => (
                   <th key={col} style={thS(col)} onClick={() => handleSort(col)}>{label}{arrow(col)}</th>
                 ))}
@@ -451,25 +464,22 @@ export default function HealthIndexPage() {
                   <td style={{ ...numTd, color: r.adherence_pct != null ? "#fff" : "#444", fontWeight: r.adherence_pct != null ? 500 : 400 }}>{fmt(r.adherence_pct)}%</td>
                   <td style={numTd}>{fmt(r.allotted_g)}g</td>
                   <td style={numTd}>{fmt(r.bought_g)}g</td>
-                  <td style={numTd}>{fmt(r.avg_remaining_g)}g</td>
                   <td style={numTd}>{r.repeat_count ?? "—"}</td>
-                  <td style={numTd}>{r.repeats_remaining ?? "—"}</td>
+                  <td style={numTd}>{fmtWhole(r.repeats_remaining)}</td>
                   <td style={numTd}>{r.total_visits ?? "—"}</td>
-                  <td style={numTd}>{fmt(r.purchase_rate_pct)}%</td>
                   <td style={numTd}>{fmt(r.avg_visits_per_month)}</td>
                   <td style={numTd}>{fmt(r.avg_days_between_visits)}</td>
                   <td style={{ padding: "10px 12px", fontSize: 11, color: r.visit_tier === "frequent" ? "#4ade80" : r.visit_tier === "occasional" ? "#facc15" : r.visit_tier === "rare" ? "#f87171" : "#666" }}>
                     {r.visit_tier ?? "—"}
                   </td>
-                  <td style={{ padding: "10px 12px", fontSize: 11, color: r.conversion_tier === "high_converter" ? "#34d399" : r.conversion_tier === "moderate_converter" ? "#fbbf24" : r.conversion_tier === "low_converter" ? "#f87171" : "#666" }}>
-                    {r.conversion_tier?.replace(/_/g, " ") ?? "—"}
-                  </td>
                   <td style={{ ...numTd, color: "#555" }}>{r.last_visit ? String(r.last_visit).slice(0, 10) : "—"}</td>
-                  <td style={{ ...numTd, color: "#555" }}>{r.signed_up ? String(r.signed_up).slice(0, 10) : "—"}</td>
+                  <td style={{ ...numTd, color: isExpiredUtc(r.script_end_date) ? "#ef4444" : "#555", fontWeight: isExpiredUtc(r.script_end_date) ? 600 : 400 }}>
+                    {r.script_end_date ? String(r.script_end_date).slice(0, 10) : "—"}
+                  </td>
                 </tr>
               ))}
               {pageRows.length === 0 && (
-                <tr><td colSpan={18} style={{ padding: "60px 12px", textAlign: "center", color: "#555" }}>No records match the current filters.</td></tr>
+                <tr><td colSpan={15} style={{ padding: "60px 12px", textAlign: "center", color: "#555" }}>No records match the current filters.</td></tr>
               )}
             </tbody>
           </table>
@@ -513,7 +523,6 @@ export default function HealthIndexPage() {
                 ["Allotted", `${fmt(panel.allotted_g)}g`],
                 ["Repeats", String(panel.repeat_count ?? "—")],
                 ["Visits", String(panel.total_visits ?? "—")],
-                ["Conv %", `${fmt(panel.purchase_rate_pct)}%`],
                 ["Vis/mo", String(fmt(panel.avg_visits_per_month))],
                 ["Last visit", panel.last_visit ? String(panel.last_visit).slice(0, 10) : "—"],
               ].map(([label, val]) => (

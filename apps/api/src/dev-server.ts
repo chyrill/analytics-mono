@@ -331,16 +331,18 @@ function buildHealthQuery(from?: string, to?: string) {
   WITH
   -- Latest supply snapshot per distinct fill window (interval_key) for each patient.
   supply_by_interval AS (
-    SELECT DISTINCT ON (email, interval_key)
-      email,
+    SELECT DISTINCT ON (LOWER(TRIM(email)), interval_key)
+      LOWER(TRIM(email))                          AS email,
       interval_key,
       supply_interval_total     AS allotted_this_interval,
       supply_used_interval      AS used_this_interval,
       supply_remaining_interval AS remaining_this_interval,
       supply_remaining_repeats  AS remaining_repeats_snapshot
     FROM supply_tracking
-    WHERE supply_interval_total IS NOT NULL AND supply_interval_total::numeric > 0
-    ORDER BY email, interval_key, source_created_at DESC
+    WHERE email IS NOT NULL
+      AND supply_interval_total IS NOT NULL
+      AND supply_interval_total::numeric > 0
+    ORDER BY LOWER(TRIM(email)), interval_key, source_created_at DESC
   ),
   allowance_totals AS (
     SELECT
@@ -353,19 +355,124 @@ function buildHealthQuery(from?: string, to?: string) {
     FROM supply_by_interval
     GROUP BY email
   ),
+  tracker_selected AS (
+    SELECT
+      LOWER(TRIM(tpt.email)) AS email,
+      tpt.repeats::numeric AS repeats,
+      tpt.script_expiration_date::date AS script_end_date,
+      CASE
+        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN 26
+        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN 29
+        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN 22
+        ELSE NULL
+      END AS strength,
+      CASE
+        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN tpt.supply_total_26::numeric
+        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN tpt.supply_total_29::numeric
+        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN tpt.supply_total_22::numeric
+        ELSE NULL
+      END AS supply_total_active,
+      CASE
+        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN tpt.supply_interval_total_26::numeric
+        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN tpt.supply_interval_total_29::numeric
+        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN tpt.supply_interval_total_22::numeric
+        ELSE NULL
+      END AS supply_interval_total_active,
+      CASE
+        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN tpt.repeats_remaining_26::numeric
+        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN tpt.repeats_remaining_29::numeric
+        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN tpt.repeats_remaining_22::numeric
+        ELSE NULL
+      END AS repeats_remaining_active
+    FROM db_treatment_plan_tracker tpt
+    WHERE tpt.email IS NOT NULL
+  ),
   -- Saleor orders = consumed grams cross-reference (filtered by date range when provided).
   saleor_used AS (
     SELECT
-      email,
+      LOWER(TRIM(email))      AS email,
       SUM(total_grams::numeric)  AS used_g,
       COUNT(*)::int              AS order_count
     FROM saleor_orders
     WHERE email IS NOT NULL${saleorFilter}
-    GROUP BY email
+    GROUP BY LOWER(TRIM(email))
+  ),
+  order_weight_used AS (
+    SELECT
+      LOWER(TRIM(email)) AS email,
+      SUM(COALESCE(weight_22::numeric, 0)) AS used_22_g,
+      SUM(COALESCE(weight_26::numeric, 0)) AS used_26_g,
+      SUM(COALESCE(weight_29::numeric, 0)) AS used_29_g,
+      COUNT(*)::int                         AS order_count
+    FROM orders_dispatched
+    WHERE email IS NOT NULL
+    GROUP BY LOWER(TRIM(email))
+  ),
+  adherence_calc AS (
+    SELECT
+      ts.email,
+      ts.strength,
+      ts.repeats,
+      ts.supply_total_active,
+      ts.supply_interval_total_active,
+      ts.repeats_remaining_active,
+      ts.script_end_date,
+      LEAST(
+        GREATEST(COALESCE(ow.order_count, su.order_count, 0) - 1, 0),
+        GREATEST(COALESCE(ts.repeats, 0)::int - 1, 0)
+      )::numeric AS repeat_index,
+      COALESCE(
+        CASE ts.strength
+          WHEN 26 THEN NULLIF(ow.used_26_g, 0)
+          WHEN 29 THEN NULLIF(ow.used_29_g, 0)
+          WHEN 22 THEN NULLIF(ow.used_22_g, 0)
+          ELSE NULL
+        END,
+        su.used_g,
+        0
+      ) AS bought_g_resolved,
+      (ts.supply_total_active - (
+        LEAST(
+          GREATEST(COALESCE(ow.order_count, su.order_count, 0) - 1, 0),
+          GREATEST(COALESCE(ts.repeats, 0)::int - 1, 0)
+        )::numeric * ts.supply_interval_total_active
+      )) AS adherence_denominator,
+      CASE
+        WHEN ts.supply_total_active IS NULL
+          OR ts.supply_interval_total_active IS NULL
+          OR (ts.supply_total_active - (
+            LEAST(
+              GREATEST(COALESCE(ow.order_count, su.order_count, 0) - 1, 0),
+              GREATEST(COALESCE(ts.repeats, 0)::int - 1, 0)
+            )::numeric * ts.supply_interval_total_active
+          )) <= 0
+          THEN NULL
+        ELSE (
+          COALESCE(
+            CASE ts.strength
+              WHEN 26 THEN NULLIF(ow.used_26_g, 0)
+              WHEN 29 THEN NULLIF(ow.used_29_g, 0)
+              WHEN 22 THEN NULLIF(ow.used_22_g, 0)
+              ELSE NULL
+            END,
+            su.used_g,
+            0
+          )
+          / NULLIF((ts.supply_total_active - (
+            LEAST(
+              GREATEST(COALESCE(ow.order_count, su.order_count, 0) - 1, 0),
+              GREATEST(COALESCE(ts.repeats, 0)::int - 1, 0)
+            )::numeric * ts.supply_interval_total_active
+          )), 0)
+        )
+      END AS adherence_ratio
+    FROM tracker_selected ts
+    LEFT JOIN order_weight_used ow ON ow.email = ts.email
+    LEFT JOIN saleor_used su ON su.email = ts.email
   ),
   shop_engagement AS (
     SELECT
-      email,
+      LOWER(TRIM(email))                                                     AS email,
       COUNT(*)                                                             AS total_visits,
       COUNT(*) FILTER (WHERE is_converted = true)                         AS total_purchases,
       ROUND(COUNT(*) FILTER (WHERE is_converted = true)::numeric / NULLIF(COUNT(*), 0) * 100, 1) AS purchase_rate_pct,
@@ -381,32 +488,46 @@ function buildHealthQuery(from?: string, to?: string) {
       (MAX(source_created_at) AT TIME ZONE 'Australia/Sydney')::date       AS last_visit
     FROM cart_sessions
     WHERE is_deleted = false AND email IS NOT NULL${cartFilter}
-    GROUP BY email
+    GROUP BY LOWER(TRIM(email))
   )
   SELECT
     c.name                                                                 AS patient_name,
     zc.email                                                               AS email,
     (c.created_at AT TIME ZONE 'Australia/Sydney')::date                  AS signed_up,
-    at.repeat_count                                                        AS repeat_count,
-    at.repeats_remaining                                                   AS repeats_remaining,
-    ROUND(at.allotted_g, 1)                                               AS allotted_g,
-    ROUND(COALESCE(su.used_g, 0), 1)                                      AS bought_g,
+    COALESCE(ts.script_end_date, ac.script_end_date)                      AS script_end_date,
+    COALESCE(ts.repeats::int, ac.repeats::int, at.repeat_count)           AS repeat_count,
+    COALESCE(ts.repeats_remaining_active, at.repeats_remaining::numeric)  AS repeats_remaining,
+    ROUND(COALESCE(ts.supply_total_active, ac.supply_total_active, at.allotted_g), 1) AS allotted_g,
+    ROUND(COALESCE(
+      CASE ts.strength
+        WHEN 26 THEN NULLIF(ow.used_26_g, 0)
+        WHEN 29 THEN NULLIF(ow.used_29_g, 0)
+        WHEN 22 THEN NULLIF(ow.used_22_g, 0)
+        ELSE NULL
+      END,
+      ac.bought_g_resolved,
+      su.used_g,
+      0
+    ), 1)                                                                  AS bought_g,
     ROUND(at.avg_remaining_g, 1)                                          AS avg_remaining_g,
-    ROUND(COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) * 100, 1)   AS adherence_pct,
+    ROUND(
+      LEAST(
+        COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)),
+        1
+      ) * 100,
+      1
+    ) AS adherence_pct,
     ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
     at.avg_allotted_g                                                     AS avg_allotted_g,
     CASE
       WHEN (at.allotted_g IS NULL OR at.allotted_g = 0)
            AND zc.supply_date IS NOT NULL                                  THEN 'red'
       WHEN at.allotted_g IS NULL OR at.allotted_g = 0                     THEN NULL
-      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
-             / at.allotted_g < 0.25
-           AND COALESCE(at.repeat_count, 0)         >= 3
+       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
+         AND COALESCE(ac.repeats::int, at.repeat_count, 0) >= 3
            AND COALESCE(se.purchase_rate_pct, 100)  >= 60                 THEN 'purple'
-      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
-             / at.allotted_g < 0.50                                       THEN 'green'
-      WHEN GREATEST(at.allotted_g - COALESCE(su.used_g, 0), 0)
-             / at.allotted_g < 0.75                                       THEN 'orange'
+       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.50 THEN 'green'
+       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.25 THEN 'orange'
       ELSE 'red'
     END                                                                    AS adherence_group,
     se.total_visits,
@@ -428,38 +549,41 @@ function buildHealthQuery(from?: string, to?: string) {
       ELSE NULL
     END                                                                    AS conversion_tier,
     CASE
-      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75
+      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
            AND se.avg_visits_per_month >= 4
            AND se.purchase_rate_pct    >= 60                              THEN 'loyal_power_buyer'
-      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75    THEN 'high_adherent'
+      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75 THEN 'high_adherent'
       WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60
-           AND (at.allotted_g IS NULL
-             OR COALESCE(su.used_g, 0) / at.allotted_g < 0.75)          THEN 'active_partial_buyer'
+           AND (COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
+             OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.75) THEN 'active_partial_buyer'
       WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 'window_shopper'
       WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 'casual_buyer'
       WHEN (se.avg_visits_per_month < 1 OR se.avg_visits_per_month IS NULL)
-           AND (at.allotted_g IS NULL
-             OR COALESCE(su.used_g, 0) / at.allotted_g < 0.25)          THEN 'at_risk'
+           AND (COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
+             OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.25) THEN 'at_risk'
       ELSE 'needs_review'
     END                                                                    AS customer_pattern
   FROM zoho_contacts                                                        zc
-  LEFT JOIN allowance_totals        at  ON  at.email       = zc.email
-  LEFT JOIN saleor_used             su  ON  su.email       = zc.email
-  LEFT JOIN shop_engagement         se  ON  se.email       = zc.email
-  LEFT JOIN customers               c   ON  c.email        = zc.email
-  WHERE zc.email IS NOT NULL
+  LEFT JOIN tracker_selected        ts  ON  ts.email       = LOWER(TRIM(zc.email))
+  LEFT JOIN allowance_totals        at  ON  at.email       = LOWER(TRIM(zc.email)) AND ts.strength IS NULL
+  LEFT JOIN saleor_used             su  ON  su.email       = LOWER(TRIM(zc.email))
+  LEFT JOIN adherence_calc          ac  ON  ac.email       = LOWER(TRIM(zc.email))
+  LEFT JOIN order_weight_used       ow  ON  ow.email       = LOWER(TRIM(zc.email))
+  LEFT JOIN shop_engagement         se  ON  se.email       = LOWER(TRIM(zc.email))
+  LEFT JOIN customers               c   ON  LOWER(TRIM(c.email)) = LOWER(TRIM(zc.email))
+  WHERE zc.email IS NOT NULL AND TRIM(zc.email) <> ''
   ORDER BY
     CASE
-      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75
+      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
            AND se.avg_visits_per_month >= 4
            AND se.purchase_rate_pct    >= 60                              THEN 1
-      WHEN COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) >= 0.75    THEN 2
+      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75 THEN 2
       WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60   THEN 3
       WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 4
       WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 5
       ELSE 6
     END,
-    COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0) DESC NULLS LAST
+    COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) DESC NULLS LAST
 `);
 }
 // Saleor is now the direct usage source in buildHealthQuery — no post-processing needed.
@@ -502,7 +626,7 @@ app.get("/health-data/export", async (req, res) => {
       ["purchase_rate_pct", "Conv %"],
       ["avg_visits_per_month", "Vis/mo"],
       ["last_visit", "Last Visit"],
-      ["signed_up", "Signed Up"],
+      ["script_end_date", "Script End Date"],
       ["customer_pattern", "Pattern"],
       ["visit_tier", "Visit Tier"],
       ["conversion_tier", "Conv Tier"],
