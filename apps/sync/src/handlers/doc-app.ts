@@ -750,80 +750,43 @@ async function syncDocTreatmentPlanTracker(
   conn: Sql,
   jobId: string,
 ): Promise<{ fetched: number; upserted: number }> {
-  const since = await getCheckpoint("docapp", "treatment_plan_tracker");
   const syncedAt = new Date();
 
-  let rows: TreatmentPlanTrackerRow[];
-  if (since) {
-    console.log(`[docapp-sync] treatment_plan_tracker: incremental since ${since.toISOString()}`);
-    rows = await conn<TreatmentPlanTrackerRow[]>`
-      SELECT
-        lower(btrim(email))       AS email,
-        synced_date::text,
-        repeats,
-        script_start_date::text,
-        script_expiration_date::text,
-        consulting_doctor,
-        supply_interval,
-        repeats_remaining_22,
-        repeats_remaining_26,
-        repeats_remaining_29,
-        supply_total_22,
-        supply_total_26,
-        supply_total_29,
-        supply_used_total_22,
-        supply_used_total_26,
-        supply_used_total_29,
-        supply_interval_total_22,
-        supply_interval_total_26,
-        supply_interval_total_29,
-        supply_used_interval_22,
-        supply_used_interval_26,
-        supply_used_interval_29,
-        supply_interval_start_22::text,
-        supply_interval_start_26::text,
-        supply_interval_start_29::text,
-        "needsUpdate"             AS needs_update
-      FROM treatmentplantracker
-      WHERE email IS NOT NULL
-        AND btrim(email) != ''
-        AND synced_date > ${since}
-    `;
-  } else {
-    console.log("[docapp-sync] treatment_plan_tracker: full scan");
-    rows = await conn<TreatmentPlanTrackerRow[]>`
-      SELECT
-        lower(btrim(email))       AS email,
-        synced_date::text,
-        repeats,
-        script_start_date::text,
-        script_expiration_date::text,
-        consulting_doctor,
-        supply_interval,
-        repeats_remaining_22,
-        repeats_remaining_26,
-        repeats_remaining_29,
-        supply_total_22,
-        supply_total_26,
-        supply_total_29,
-        supply_used_total_22,
-        supply_used_total_26,
-        supply_used_total_29,
-        supply_interval_total_22,
-        supply_interval_total_26,
-        supply_interval_total_29,
-        supply_used_interval_22,
-        supply_used_interval_26,
-        supply_used_interval_29,
-        supply_interval_start_22::text,
-        supply_interval_start_26::text,
-        supply_interval_start_29::text,
-        "needsUpdate"             AS needs_update
-      FROM treatmentplantracker
-      WHERE email IS NOT NULL
-        AND btrim(email) != ''
-    `;
-  }
+  // Always full scan — doc-app only sets needsUpdate=TRUE when repeats/script_expiration_date
+  // change, it never updates synced_date, so incremental filtering would miss those updates.
+  console.log("[docapp-sync] treatment_plan_tracker: full scan");
+  const rows = await conn<TreatmentPlanTrackerRow[]>`
+    SELECT
+      lower(btrim(email))       AS email,
+      synced_date::text,
+      repeats,
+      script_start_date::text,
+      script_expiration_date::text,
+      consulting_doctor,
+      supply_interval,
+      repeats_remaining_22,
+      repeats_remaining_26,
+      repeats_remaining_29,
+      supply_total_22,
+      supply_total_26,
+      supply_total_29,
+      supply_used_total_22,
+      supply_used_total_26,
+      supply_used_total_29,
+      supply_interval_total_22,
+      supply_interval_total_26,
+      supply_interval_total_29,
+      supply_used_interval_22,
+      supply_used_interval_26,
+      supply_used_interval_29,
+      supply_interval_start_22::text,
+      supply_interval_start_26::text,
+      supply_interval_start_29::text,
+      "needsUpdate"             AS needs_update
+    FROM treatmentplantracker
+    WHERE email IS NOT NULL
+      AND btrim(email) != ''
+  `;
 
   console.log(`[docapp-sync] fetched ${rows.length} treatment plan tracker rows`);
   if (rows.length === 0) {
