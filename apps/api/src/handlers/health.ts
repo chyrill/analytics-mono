@@ -110,6 +110,23 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     FROM supply_by_interval
     GROUP BY email
   ),
+  supply_engagement AS (
+    SELECT
+      email,
+      COUNT(*)                                                               AS total_visits,
+      ROUND(COUNT(*)::numeric / GREATEST(
+        EXTRACT(EPOCH FROM (NOW() - MIN(interval_key::date))) / (30.44 * 86400.0), 1
+      ), 1)                                                                  AS avg_visits_per_month,
+      CASE
+        WHEN COUNT(*) > 1 THEN
+          ROUND((MAX(interval_key::date) - MIN(interval_key::date))::numeric
+            / NULLIF(COUNT(*) - 1, 0), 1)
+        ELSE NULL
+      END                                                                    AS avg_days_between_visits,
+      MAX(interval_key::date)                                                AS last_visit
+    FROM supply_by_interval
+    GROUP BY email
+  ),
   tracker_selected AS (
     SELECT
       LOWER(TRIM(tpt.email)) AS email,
@@ -367,12 +384,12 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
        WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.25 THEN 'orange'
       ELSE 'red'
     END                                                                    AS adherence_group,
-    se.total_visits, se.total_purchases, se.purchase_rate_pct,
-    se.avg_visits_per_month, se.avg_days_between_visits, se.last_visit,
+    supe.total_visits, se.total_purchases, se.purchase_rate_pct,
+    supe.avg_visits_per_month, supe.avg_days_between_visits, supe.last_visit,
     CASE
-      WHEN se.avg_visits_per_month >= 4   THEN 'frequent'
-      WHEN se.avg_visits_per_month >= 1   THEN 'occasional'
-      WHEN se.avg_visits_per_month IS NOT NULL THEN 'rare'
+      WHEN supe.avg_visits_per_month >= 4   THEN 'frequent'
+      WHEN supe.avg_visits_per_month >= 1   THEN 'occasional'
+      WHEN supe.avg_visits_per_month IS NOT NULL THEN 'rare'
       ELSE NULL
     END AS visit_tier,
     CASE
@@ -383,16 +400,16 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
     END AS conversion_tier,
     CASE
        WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
-           AND se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60 THEN 'loyal_power_buyer'
+           AND supe.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60 THEN 'loyal_power_buyer'
        WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75 THEN 'high_adherent'
-      WHEN se.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60
+      WHEN supe.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60
          AND (
            COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
            OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.75
          ) THEN 'active_partial_buyer'
-      WHEN se.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 'window_shopper'
-      WHEN se.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 'casual_buyer'
-      WHEN (se.avg_visits_per_month < 1 OR se.avg_visits_per_month IS NULL)
+      WHEN supe.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 'window_shopper'
+      WHEN supe.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 'casual_buyer'
+      WHEN (supe.avg_visits_per_month < 1 OR supe.avg_visits_per_month IS NULL)
          AND (
            COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
            OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.25
@@ -404,8 +421,9 @@ function buildHealthQuery(from?: string | null, to?: string | null) {
   LEFT JOIN tracker_selected tps ON tps.email = LOWER(TRIM(zc.email))
   LEFT JOIN allowance_totals at  ON at.email  = LOWER(TRIM(zc.email)) AND tps.strength IS NULL
   LEFT JOIN saleor_used      su  ON su.email  = LOWER(TRIM(zc.email))
-  LEFT JOIN shop_engagement  se  ON se.email  = LOWER(TRIM(zc.email))
-  LEFT JOIN customers        c   ON LOWER(TRIM(c.email)) = LOWER(TRIM(zc.email))
+  LEFT JOIN shop_engagement   se   ON se.email   = LOWER(TRIM(zc.email))
+  LEFT JOIN supply_engagement  supe ON supe.email = LOWER(TRIM(zc.email))
+  LEFT JOIN customers          c    ON LOWER(TRIM(c.email)) = LOWER(TRIM(zc.email))
   LEFT JOIN adherence_calc   ac  ON ac.email  = LOWER(TRIM(zc.email))
   LEFT JOIN order_weight_used ow ON ow.email  = LOWER(TRIM(zc.email))
   LEFT JOIN last_order       lo  ON lo.email  = LOWER(TRIM(zc.email))

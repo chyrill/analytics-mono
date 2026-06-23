@@ -11,9 +11,16 @@ pnpm build
 
 # ── API Lambdas ────────────────────────────────────────────────────────────────
 echo "==> Deploying API Lambda functions"
-for HANDLER in customers ingest; do
+for HANDLER in customers ingest sync auth users roles health; do
+  BUNDLE_DIR="/tmp/analytics-api-${HANDLER}"
+  rm -rf "${BUNDLE_DIR}" && mkdir -p "${BUNDLE_DIR}"
+  npx esbuild "apps/api/src/handlers/${HANDLER}.ts" \
+    --bundle --platform=node --target=node20 \
+    --conditions=require \
+    --outfile="${BUNDLE_DIR}/${HANDLER}.js" \
+    --external:pg-native
   ZIP="/tmp/analytics-api-${HANDLER}.zip"
-  zip -j "${ZIP}" "apps/api/dist/handlers/${HANDLER}.js"
+  (cd "${BUNDLE_DIR}" && zip -r "${ZIP}" .)
   aws lambda update-function-code \
     --function-name "harvest-analytics-api-${HANDLER}-${STAGE}" \
     --zip-file "fileb://${ZIP}" \
@@ -24,8 +31,15 @@ done
 # ── Sync Lambdas ───────────────────────────────────────────────────────────────
 echo "==> Deploying Sync Lambda functions"
 for HANDLER in zoho saleor doc-app; do
+  BUNDLE_DIR="/tmp/analytics-sync-${HANDLER}"
+  rm -rf "${BUNDLE_DIR}" && mkdir -p "${BUNDLE_DIR}"
+  npx esbuild "apps/sync/src/handlers/${HANDLER}.ts" \
+    --bundle --platform=node --target=node20 \
+    --conditions=require \
+    --outfile="${BUNDLE_DIR}/${HANDLER}.js" \
+    --external:pg-native
   ZIP="/tmp/analytics-sync-${HANDLER}.zip"
-  zip -j "${ZIP}" "apps/sync/dist/handlers/${HANDLER}.js"
+  (cd "${BUNDLE_DIR}" && zip -r "${ZIP}" .)
   aws lambda update-function-code \
     --function-name "harvest-analytics-sync-${HANDLER}-${STAGE}" \
     --zip-file "fileb://${ZIP}" \
