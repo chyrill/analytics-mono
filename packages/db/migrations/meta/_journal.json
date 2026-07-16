@@ -57,6 +57,13 @@
       "when": 1781490409865,
       "tag": "0007_public_alice",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1784171579172,
+      "tag": "0008_complex_sentry",
+      "breakpoints": true
     }
   ]
 }

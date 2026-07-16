@@ -23,6 +23,51 @@ interface PatientRow {
 
 type FunnelFilter = "all" | "registered_only" | "registered_purchased" | "saleor_only";
 
+interface OrderLineDetail {
+  product_name: string | null;
+  variant_name: string | null;
+  strain: string | null;
+  thc_level: string | null;
+  cut: string | null;
+  grams: number | null;
+  quantity: number | null;
+}
+
+interface OrderDetail {
+  order_id: string;
+  order_number: number | null;
+  status: string | null;
+  total_grams: number | null;
+  total_amount: number | null;
+  currency: string | null;
+  ordered_at: string;
+  lines: OrderLineDetail[];
+}
+
+interface PatientDetail {
+  email: string;
+  stale: boolean;
+  orders: OrderDetail[];
+  cadence: {
+    last_order_date: string | null;
+    avg_days_between_orders: number | null;
+    avg_orders_per_month: number | null;
+    avg_grams_per_order: number | null;
+  };
+  current_plan: { outcome: string | null; date: string | null; type: string | null; diagnosis: string | null } | null;
+  allowance: {
+    repeats: number | null;
+    repeats_remaining: number | null;
+    script_expiration_date: string | null;
+    needs_update: boolean | null;
+    allotted_g: number | null;
+    bought_g: number | null;
+    remaining_g: number | null;
+    predicted_run_out_date: string | null;
+  };
+  strains_explored: string[];
+}
+
 // ── Funnel stage helpers ───────────────────────────────────────────────────────
 function funnelStage(r: PatientRow): FunnelFilter {
   if (r.has_docapp && r.has_saleor) return "registered_purchased";
@@ -47,6 +92,10 @@ export default function PatientRegistryPage() {
   const [sortCol, setSortCol]   = useState("created_at");
   const [sortDir, setSortDir]   = useState<1 | -1>(-1);
   const [page, setPage]         = useState(1);
+  const [panel, setPanel]                 = useState<PatientRow | null>(null);
+  const [detail, setDetail]               = useState<PatientDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError]     = useState<string | null>(null);
 
   function load() {
     setLoading(true); setError(null);
@@ -58,6 +107,23 @@ export default function PatientRegistryPage() {
   }
 
   useEffect(() => { load(); }, []);
+
+  // Load patient detail when the drawer opens
+  useEffect(() => {
+    if (!panel) { setDetail(null); setDetailError(null); return; }
+    setDetail(null); setDetailError(null); setDetailLoading(true);
+    fetch(`${API_BASE}/patient-orders-detail?email=${encodeURIComponent(panel.email)}`)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<PatientDetail>; })
+      .then(setDetail)
+      .catch((e: Error) => setDetailError(e.message))
+      .finally(() => setDetailLoading(false));
+  }, [panel?.email]);
+
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") setPanel(null); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, []);
 
   // Funnel counts
   const counts = useMemo(() => {
@@ -226,7 +292,8 @@ export default function PatientRegistryPage() {
                 const stage = funnelStage(r);
                 const sc = STAGE_CONFIG[stage];
                 return (
-                  <tr key={r.id} style={{ borderBottom: "1px solid #1a1a1a" }}
+                  <tr key={r.id} style={{ borderBottom: "1px solid #1a1a1a", cursor: "pointer" }}
+                    onClick={() => setPanel(r)}
                     onMouseEnter={(e) => (e.currentTarget.style.background = "#141414")}
                     onMouseLeave={(e) => (e.currentTarget.style.background = "")}>
                     <td style={{ padding: "9px 12px", fontWeight: 500, color: "#ddd", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
@@ -282,6 +349,31 @@ export default function PatientRegistryPage() {
           <button onClick={() => setPage(totalPages)} disabled={safePage === totalPages} style={ghostBtn}>»</button>
         </div>
       )}
+
+      {/* ── Patient Detail Drawer ── */}
+      {panel && (
+        <>
+          <div onClick={() => setPanel(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 100 }} />
+          <div style={{ position: "fixed", top: 0, right: 0, width: 600, maxWidth: "100vw", height: "100vh", background: "#141414", borderLeft: "1px solid #222", zIndex: 101, overflowY: "auto" }}>
+            <div style={{ padding: "24px 24px 16px", borderBottom: "1px solid #1e1e1e", position: "sticky", top: 0, background: "#141414", zIndex: 1, display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div>
+                <h2 style={{ fontSize: 16, fontWeight: 600, color: "#fff", margin: 0 }}>{panel.name ?? panel.email}</h2>
+                <div style={{ fontSize: 12, color: "#555", marginTop: 4 }}>{panel.email}</div>
+                {detail?.stale && (
+                  <div style={{ display: "inline-flex", marginTop: 8, fontSize: 11, color: "#fbbf24", background: "#1f1800", border: "1px solid #3d2e00", borderRadius: 4, padding: "3px 8px" }}>
+                    ⚠ Live allowance unavailable — showing last synced data
+                  </div>
+                )}
+              </div>
+              <button onClick={() => setPanel(null)} style={{ background: "none", border: "none", color: "#555", fontSize: 18, cursor: "pointer", padding: "4px 8px", borderRadius: 4, lineHeight: 1 }}>✕</button>
+            </div>
+
+            {detailLoading && <div style={{ padding: "40px", textAlign: "center", color: "#555", fontSize: 13 }}>Loading patient detail…</div>}
+            {detailError && <div style={{ padding: "40px", textAlign: "center", color: "#ef4444", fontSize: 13 }}>Error: {detailError}</div>}
+            {detail && !detailLoading && <PatientDetailBody detail={detail} />}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -315,6 +407,120 @@ function FunnelArrow({ label }: { label: string }) {
 function StateMsg({ children, isError }: { children: React.ReactNode; isError?: boolean }) {
   return <div style={{ textAlign: "center", padding: "80px 0", color: isError ? "#ef4444" : "#555", fontSize: 14 }}>{children}</div>;
 }
+
+// ── Drawer body ────────────────────────────────────────────────────────────────
+function daysAgo(dateStr: string | null): number | null {
+  if (!dateStr) return null;
+  const t = new Date(dateStr).getTime();
+  if (Number.isNaN(t)) return null;
+  return Math.round((Date.now() - t) / 86_400_000);
+}
+
+function PatientDetailBody({ detail }: { detail: PatientDetail }) {
+  const { cadence, allowance, current_plan, orders, strains_explored } = detail;
+  const recencyDays = daysAgo(cadence.last_order_date);
+  const runOutDays = allowance.predicted_run_out_date ? daysAgo(allowance.predicted_run_out_date) : null; // negative = days until
+  const atRisk = runOutDays != null && runOutDays >= -14; // run-out within the next 2 weeks, or already passed
+  const pctUsed =
+    allowance.allotted_g && allowance.allotted_g > 0
+      ? Math.min(100, Math.round(((allowance.bought_g ?? 0) / allowance.allotted_g) * 100))
+      : null;
+
+  const maxGrams = Math.max(1, ...orders.map((o) => o.total_grams ?? 0));
+
+  return (
+    <div style={{ padding: "20px 24px" }}>
+      {/* Hero band */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+        <div style={{ background: "#1a1a1a", borderRadius: 6, padding: "14px 16px" }}>
+          <div style={{ fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>Recency</div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: "#fff", marginTop: 6 }}>
+            {recencyDays != null ? `${recencyDays}d ago` : "—"}
+          </div>
+          <div style={{ fontSize: 11, color: "#555", marginTop: 4 }}>
+            {cadence.last_order_date ? new Date(cadence.last_order_date).toLocaleDateString("en-AU") : "no orders yet"}
+          </div>
+        </div>
+        <div style={{ background: atRisk ? "#1f1400" : "#1a1a1a", border: atRisk ? "1px solid #3d2e00" : "none", borderRadius: 6, padding: "14px 16px" }}>
+          <div style={{ fontSize: 10, color: atRisk ? "#fbbf24" : "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>
+            {atRisk ? "⚠ At risk" : "Depletion"}
+          </div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: atRisk ? "#fbbf24" : "#fff", marginTop: 6 }}>
+            {allowance.remaining_g != null ? `${allowance.remaining_g.toFixed(1)}g left` : "—"}
+          </div>
+          <div style={{ fontSize: 11, color: "#555", marginTop: 4 }}>
+            {allowance.predicted_run_out_date
+              ? `predicted run-out ${new Date(allowance.predicted_run_out_date).toLocaleDateString("en-AU")}`
+              : "not enough history to predict"}
+          </div>
+          {pctUsed != null && (
+            <div style={{ height: 5, background: "#0f0f0f", borderRadius: 3, marginTop: 8 }}>
+              <div style={{ height: "100%", width: `${pctUsed}%`, background: atRisk ? "#fbbf24" : "#818cf8", borderRadius: 3 }} />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Frequency sparkline */}
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 11, color: "#555", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 10 }}>
+          Order Frequency &amp; Basket Size {cadence.avg_orders_per_month != null && `· ${cadence.avg_orders_per_month.toFixed(1)}/mo avg`}
+        </div>
+        {orders.length === 0 ? (
+          <div style={{ fontSize: 12, color: "#555" }}>No Saleor orders on record.</div>
+        ) : (
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height: 60 }}>
+            {orders.slice().reverse().map((o) => (
+              <div key={o.order_id} title={`${o.total_grams ?? 0}g · ${new Date(o.ordered_at).toLocaleDateString("en-AU")}`}
+                style={{ flex: 1, minWidth: 4, height: `${Math.max(6, ((o.total_grams ?? 0) / maxGrams) * 60)}px`, background: "#818cf8", borderRadius: 2 }} />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Supporting cast */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+        <div style={{ background: "#1a1a1a", borderRadius: 6, padding: "12px 14px" }}>
+          <div style={{ fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>Plan status</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "#fff", marginTop: 6 }}>{current_plan?.outcome ?? "No active plan"}</div>
+          {allowance.script_expiration_date && (
+            <div style={{ fontSize: 11, color: "#555", marginTop: 4 }}>
+              expires {new Date(allowance.script_expiration_date).toLocaleDateString("en-AU")}
+            </div>
+          )}
+        </div>
+        <div style={{ background: "#1a1a1a", borderRadius: 6, padding: "12px 14px" }}>
+          <div style={{ fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>Strains explored</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "#fff", marginTop: 6 }}>{strains_explored.length || "—"}</div>
+          {strains_explored.length > 0 && (
+            <div style={{ fontSize: 11, color: "#666", marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {strains_explored.join(", ")}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Recent orders */}
+      <div>
+        <div style={{ fontSize: 11, color: "#555", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 10 }}>Recent orders</div>
+        {orders.slice(0, 8).map((o) => (
+          <div key={o.order_id} style={{ borderBottom: "1px solid #1e1e1e", padding: "8px 0" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#ddd" }}>
+              <span>#{o.order_number ?? o.order_id.slice(0, 8)}</span>
+              <span style={{ color: "#555" }}>{new Date(o.ordered_at).toLocaleDateString("en-AU")}</span>
+            </div>
+            <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>
+              {o.total_grams != null ? `${o.total_grams}g` : "—"}
+              {o.lines.length > 0 && ` · ${o.lines.map((l) => l.strain ?? l.product_name).filter(Boolean).join(", ")}`}
+            </div>
+          </div>
+        ))}
+        {orders.length === 0 && <div style={{ fontSize: 12, color: "#555" }}>No orders yet.</div>}
+      </div>
+    </div>
+  );
+}
+
 
 // ── Styles ─────────────────────────────────────────────────────────────────────
 const navLink:     React.CSSProperties = { fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px", whiteSpace: "nowrap" };

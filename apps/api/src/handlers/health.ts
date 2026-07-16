@@ -7,6 +7,12 @@ import {
   MIRROR_ADHERENCE_PCT_SQL,
   type LivePatientHealthRow,
 } from "../lib/docapp-db";
+// GET /patient-orders-detail is served by this same Lambda (see routeKey
+// dispatch below) rather than a dedicated function — reuses this handler's
+// existing IAM role/log group/API Gateway integration instead of adding new
+// infra, consistent with how /health-data, /health-data/export, and
+// /health-detail already share this one Lambda.
+import { handler as patientOrdersDetailHandler } from "./patient-detail";
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -404,6 +410,12 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
   const qs = event.queryStringParameters ?? {};
 
   try {
+    // GET /patient-orders-detail — delegated to patient-detail.ts's handler
+    // (bundled into this same Lambda; see import comment above).
+    if (routeKey === "GET /patient-orders-detail") {
+      return patientOrdersDetailHandler(event, {} as never, (() => {}) as never) as Promise<APIGatewayProxyStructuredResultV2>;
+    }
+
     // GET /health-data
     if (routeKey === "GET /health-data") {
       const { rows, stale } = await loadHealthRows(qs.from, qs.to);

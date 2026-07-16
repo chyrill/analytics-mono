@@ -18,6 +18,7 @@ import type {
 import type { ScheduledEvent } from "aws-lambda";
 import { handler as customersHandler } from "./handlers/customers";
 import { handler as healthHandler } from "./handlers/health";
+import { handler as patientDetailHandler } from "./handlers/patient-detail";
 import { handler as ingestHandler } from "./handlers/ingest";
 import authRouter from "./routes/auth";
 import usersRouter from "./routes/users";
@@ -113,6 +114,7 @@ const invokeHealth = (req: Request, res: Response) =>
 app.get("/health-data", invokeHealth);
 app.get("/health-data/export", invokeHealth);
 app.get("/health-detail", invokeHealth);
+app.get("/patient-orders-detail", (req, res) => invoke(patientDetailHandler, req, res));
 
 // ── Sync helpers ──────────────────────────────────────────────────────────────
 

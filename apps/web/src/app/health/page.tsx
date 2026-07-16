@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import type { CSSProperties } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
@@ -34,6 +35,36 @@ interface DetailData {
   gramsByMonth: { month: string; used_g: number; allotted_g: number | null }[];
   spendByMonth: { month: string; total_spent: number; order_count: number }[];
   summary: { total_spent: string; avg_monthly_spend: string; total_visits: number; avg_grams_per_interval: string };
+}
+
+interface PatientOrderDetail {
+  email: string;
+  stale: boolean;
+  orders: {
+    order_id: string;
+    order_number: number | null;
+    ordered_at: string;
+    total_grams: number | null;
+    product_count: number;
+    strain_count: number;
+    remaining_after_g: number | null;
+  }[];
+  cadence: {
+    last_order_date: string | null;
+    avg_days_between_orders: number | null;
+    avg_orders_per_month: number | null;
+  };
+  current_plan: {
+    outcome: string | null;
+    date: string | null;
+    active_strength: { supply_interval: number | null } | null;
+  } | null;
+  allowance: {
+    allotted_g: number | null;
+    remaining_g: number | null;
+    predicted_run_out_date: string | null;
+  };
+  strains_explored: string[];
 }
 
 interface HealthDataResponse {
@@ -312,6 +343,8 @@ export default function HealthIndexPage() {
   const [panel, setPanel] = useState<HealthRow | null>(null);
   const [detail, setDetail] = useState<DetailData | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [patientOrderDetail, setPatientOrderDetail] = useState<PatientOrderDetail | null>(null);
+  const [patientOrderDetailLoading, setPatientOrderDetailLoading] = useState(false);
   const [period, setPeriod] = useState<"all" | "4m" | "custom">("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -392,6 +425,17 @@ export default function HealthIndexPage() {
       .then(setDetail)
       .catch(console.error)
       .finally(() => setDetailLoading(false));
+  }, [panel?.email]);
+
+  // Load remaining-allowance / strain / run-out detail (live doc-app + mirror fallback)
+  useEffect(() => {
+    if (!panel) { setPatientOrderDetail(null); return; }
+    setPatientOrderDetail(null); setPatientOrderDetailLoading(true);
+    fetch(`${API_BASE}/patient-orders-detail?email=${encodeURIComponent(panel.email)}`)
+      .then((r) => r.json() as Promise<PatientOrderDetail>)
+      .then(setPatientOrderDetail)
+      .catch(console.error)
+      .finally(() => setPatientOrderDetailLoading(false));
   }, [panel?.email]);
 
   // Derived stat counts
@@ -722,12 +766,130 @@ export default function HealthIndexPage() {
                 </div>
               ))}
             </div>
+            {/* Depletion / at-risk + strain exploration (live doc-app remaining allowance) */}
+            {patientOrderDetailLoading && (
+              <div style={{ padding: "16px 24px", color: "#555", fontSize: 12 }}>Loading remaining allowance…</div>
+            )}
+            {patientOrderDetail && <PatientAllowanceSummary detail={patientOrderDetail} />}
             {/* Charts (loaded when detail arrives) */}
             {detailLoading && <div style={{ padding: "40px", textAlign: "center", color: "#555", fontSize: 13 }}>Loading charts…</div>}
             {detail && <DetailCharts detail={detail} />}
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+// ── Depletion / at-risk + strain exploration summary ──────────────────────────
+function daysFromNow(dateStr: string | null): number | null {
+  if (!dateStr) return null;
+  const t = new Date(dateStr).getTime();
+  if (Number.isNaN(t)) return null;
+  return Math.round((t - Date.now()) / 86_400_000);
+}
+
+function PatientAllowanceSummary({ detail }: { detail: PatientOrderDetail }) {
+  const { allowance, cadence, current_plan, strains_explored, stale } = detail;
+  const runOutDays = daysFromNow(allowance.predicted_run_out_date);
+  const atRisk = runOutDays != null && runOutDays <= 14;
+
+  return (
+    <div style={{ padding: "16px 24px", borderBottom: "1px solid #1e1e1e" }}>
+      {stale && (
+        <div style={{ display: "inline-flex", marginBottom: 12, fontSize: 11, color: "#fbbf24", background: "#1f1800", border: "1px solid #3d2e00", borderRadius: 4, padding: "3px 8px" }}>
+          ⚠ Live allowance unavailable — showing last synced data
+        </div>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <div style={{ background: atRisk ? "#1f1400" : "#1a1a1a", border: atRisk ? "1px solid #3d2e00" : "1px solid #222", borderRadius: 6, padding: "12px 14px" }}>
+          <div style={{ fontSize: 10, color: atRisk ? "#fbbf24" : "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>
+            {atRisk ? "⚠ At risk" : "Depletion"}
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: atRisk ? "#fbbf24" : "#fff", marginTop: 6 }}>
+            {allowance.remaining_g != null ? `${allowance.remaining_g.toFixed(1)}g left` : "—"}
+          </div>
+          <div style={{ fontSize: 11, color: "#555", marginTop: 4 }}>
+            {allowance.predicted_run_out_date
+              ? `predicted run-out ${new Date(allowance.predicted_run_out_date).toLocaleDateString("en-AU")}`
+              : "not enough order history to predict"}
+          </div>
+        </div>
+        <div style={{ background: "#1a1a1a", border: "1px solid #222", borderRadius: 6, padding: "12px 14px" }}>
+          <div style={{ fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>Strains explored</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: "#fff", marginTop: 6 }}>{strains_explored.length || "—"}</div>
+          {strains_explored.length > 0 && (
+            <div style={{ fontSize: 11, color: "#666", marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {strains_explored.join(", ")}
+            </div>
+          )}
+        </div>
+      </div>
+      <div style={{ fontSize: 11, color: "#555", marginTop: 10 }}>
+        {current_plan?.outcome ? `Plan: ${current_plan.outcome}` : "No active plan"}
+        {current_plan?.date && ` · approved ${new Date(current_plan.date).toLocaleDateString("en-AU")}`}
+        {allowance.allotted_g != null && ` · ${allowance.allotted_g}g allotted`}
+        {current_plan?.active_strength?.supply_interval != null && ` / ${current_plan.active_strength.supply_interval}d`}
+        {cadence.avg_orders_per_month != null && ` · ${cadence.avg_orders_per_month.toFixed(1)} orders/mo`}
+        {cadence.avg_days_between_orders != null && ` · ${cadence.avg_days_between_orders.toFixed(0)}d between orders`}
+      </div>
+      <OrderHistoryTable orders={detail.orders} />
+    </div>
+  );
+}
+
+// ── Per-order history table ───────────────────────────────────────────────────
+function OrderHistoryTable({ orders }: { orders: PatientOrderDetail["orders"] }) {
+  if (orders.length === 0) {
+    return <div style={{ fontSize: 11, color: "#555", marginTop: 12 }}>No orders on record.</div>;
+  }
+
+  const th: CSSProperties = {
+    textAlign: "left",
+    fontSize: 10,
+    color: "#555",
+    textTransform: "uppercase",
+    letterSpacing: "0.4px",
+    padding: "6px 8px",
+    borderBottom: "1px solid #222",
+    position: "sticky",
+    top: 0,
+    background: "#141414",
+  };
+  const td: CSSProperties = { fontSize: 12, color: "#ccc", padding: "6px 8px", borderBottom: "1px solid #1a1a1a" };
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 6 }}>
+        Order history ({orders.length})
+      </div>
+      <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid #222", borderRadius: 6 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              <th style={th}>Order date</th>
+              <th style={th}>Grams</th>
+              <th style={th}>Products</th>
+              <th style={th}>Strains</th>
+              <th style={th}>Remaining after</th>
+            </tr>
+          </thead>
+          <tbody>
+            {orders.map((o) => (
+              <tr key={o.order_id}>
+                <td style={td}>
+                  {new Date(o.ordered_at).toLocaleDateString("en-AU")}
+                  {o.order_number != null && <span style={{ color: "#555" }}> #{o.order_number}</span>}
+                </td>
+                <td style={td}>{o.total_grams != null ? `${o.total_grams}g` : "—"}</td>
+                <td style={td}>{o.product_count}</td>
+                <td style={td}>{o.strain_count}</td>
+                <td style={td}>{o.remaining_after_g != null ? `${o.remaining_after_g.toFixed(1)}g` : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

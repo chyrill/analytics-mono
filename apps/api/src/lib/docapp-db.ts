@@ -231,6 +231,93 @@ export async function fetchLivePatientHealthData(): Promise<LivePatientHealthRow
 
 export { trackerSelectedCte as buildMirrorTrackerSelectedCte, ADHERENCE_PCT_SQL as MIRROR_ADHERENCE_PCT_SQL };
 
+// ── Single-patient remaining allowance (patient detail drawer) ───────────────
+//
+// Sourced live rather than from the analytics-DB sync copies (db_treatment_plan_tracker,
+// supply_tracking) — some doc-app data isn't reliably/fully synced, and this number is
+// a churn-risk hero metric for marketing, so freshness matters more than for the bulk
+// /health-data view. Reuses the same pooled-connection/timeout/mirror-fallback pattern
+// as fetchLivePatientHealthData() above. See docs/customer-health-index-deep-dive.md §2.3.
+
+export interface LivePatientAllowanceRow {
+  email: string;
+  repeats: number | null;
+  script_expiration_date: string | null;
+  needs_update: boolean | null;
+  strength: number | null;
+  supply_total_active: number | null;
+  supply_interval_total_active: number | null;
+  supply_used_total_active: number | null;
+  repeats_remaining_active: number | null;
+}
+
+/** Defensive allow-list — mirrors the sanitization already used by the /health-detail route. */
+function escapeEmailLiteral(email: string): string {
+  return email.toLowerCase().trim().replace(/[^a-z0-9.@_+-]/gi, "").replace(/'/g, "''");
+}
+
+/**
+ * Fetches remaining-allowance data for a single patient directly from doc-app's
+ * production Postgres (DOCAPP_DATABASE_URL / treatmentplantracker).
+ */
+export async function fetchLivePatientAllowance(email: string): Promise<LivePatientAllowanceRow | null> {
+  const safeEmail = escapeEmailLiteral(email);
+  if (!safeEmail) return null;
+  const sqlClient = getDocAppSql();
+  const rows = await withTimeout(
+    sqlClient.unsafe<LivePatientAllowanceRow[]>(`
+      WITH
+      population AS (
+        SELECT '${safeEmail}'::text AS email
+      ),
+      ${trackerSelectedCte("treatmentplantracker", '"needsUpdate"')}
+      SELECT
+        p.email,
+        ts.repeats,
+        ts.script_expiration_date,
+        ts.needs_update,
+        ts.strength,
+        ts.supply_total_active,
+        ts.supply_interval_total_active,
+        ts.supply_used_total_active,
+        ts.repeats_remaining_active
+      FROM population p
+      LEFT JOIN tracker_selected ts ON ts.email = p.email
+    `),
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Analytics-DB mirror fallback (raw SQL string, executed by the caller via
+ * `db.execute(sql.raw(...))`) — used only when the live doc-app connection
+ * fails. Same row shape as fetchLivePatientAllowance() so callers are
+ * source-agnostic, matching the buildMirrorPatientHealthQuery() convention in
+ * apps/api/src/handlers/health.ts.
+ */
+export function buildMirrorPatientAllowanceQuerySql(email: string): string {
+  const safeEmail = escapeEmailLiteral(email);
+  return `
+    WITH
+    population AS (
+      SELECT '${safeEmail}'::text AS email
+    ),
+    ${trackerSelectedCte("db_treatment_plan_tracker", "needs_update")}
+    SELECT
+      p.email,
+      ts.repeats,
+      ts.script_expiration_date,
+      ts.needs_update,
+      ts.strength,
+      ts.supply_total_active,
+      ts.supply_interval_total_active,
+      ts.supply_used_total_active,
+      ts.repeats_remaining_active
+    FROM population p
+    LEFT JOIN tracker_selected ts ON ts.email = p.email
+  `;
+}
+
 /** Closes the pooled connection — for graceful shutdown in tests/scripts only. */
 export async function closeDocAppSql(): Promise<void> {
   if (docAppSql) {

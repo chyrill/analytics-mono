@@ -1,5 +1,5 @@
 import type { ScheduledHandler } from "aws-lambda";
-import { db, customers, saleorOrders } from "@analytics/db";
+import { db, customers, saleorOrders, saleorOrderLines, type NewSaleorOrderLine } from "@analytics/db";
 import { sql } from "drizzle-orm";
 
 const SALEOR_CUSTOMERS_GQL = `
@@ -36,6 +36,21 @@ const SALEOR_ORDERS_GQL = `
           }
           metadata { key value }
           privateMetadata { key value }
+          lines {
+            id
+            productName
+            variantName
+            quantity
+            variant {
+              id
+              weight { value unit }
+              attributes { attribute { name } values { name } }
+              product {
+                id
+                attributes { attribute { name } values { name } }
+              }
+            }
+          }
         }
       }
     }
@@ -50,6 +65,28 @@ interface SaleorCustomer {
   dateJoined: string;
 }
 
+interface SaleorAttributeValue {
+  name: string;
+}
+
+interface SaleorAttributeAssignment {
+  attribute: { name: string };
+  values: SaleorAttributeValue[];
+}
+
+interface SaleorOrderLineNode {
+  id: string;
+  productName: string;
+  variantName: string;
+  quantity: number;
+  variant: {
+    id: string;
+    weight: { value: number; unit: string } | null;
+    attributes: SaleorAttributeAssignment[];
+    product: { id: string; attributes: SaleorAttributeAssignment[] } | null;
+  } | null;
+}
+
 interface SaleorOrderNode {
   id: string;
   number: number;
@@ -60,6 +97,36 @@ interface SaleorOrderNode {
   total: { gross: { amount: number; currency: string } } | null;
   metadata: { key: string; value: string }[];
   privateMetadata: { key: string; value: string }[];
+  lines: SaleorOrderLineNode[];
+}
+
+/** First attribute value matching a given attribute name (e.g. "Strain", "THC Level", "cut"). */
+function findAttributeValue(attrs: SaleorAttributeAssignment[] | undefined, attributeName: string): string | null {
+  return attrs?.find((a) => a.attribute.name === attributeName)?.values[0]?.name ?? null;
+}
+
+/**
+ * Converts a Saleor Weight `{ value, unit }` to grams. Unlike Order.weight
+ * (which Saleor auto-scales to a human-friendly display unit), ProductVariant.weight
+ * is returned in the shop's raw configured unit (observed as KG in this store) —
+ * so unit-aware conversion is required rather than trusting the raw value.
+ */
+const GRAMS_PER_UNIT: Record<string, number> = {
+  G: 1,
+  KG: 1000,
+  LB: 453.59237,
+  OZ: 28.349523125,
+  TONNE: 1_000_000,
+};
+
+function weightToGrams(weight: { value: number; unit: string } | null | undefined): number | null {
+  if (!weight) return null;
+  const multiplier = GRAMS_PER_UNIT[weight.unit];
+  if (multiplier == null) {
+    console.warn(`[saleor-sync] unknown weight unit "${weight.unit}", skipping conversion`);
+    return null;
+  }
+  return weight.value * multiplier;
 }
 
 // ── Rate-limiting / back-off helpers ─────────────────────────────────────────
@@ -200,13 +267,21 @@ export const handler: ScheduledHandler = async (_event) => {
   const rawOrders = await fetchAllSaleorOrders();
   console.log(`[saleor-sync] fetched ${rawOrders.length} orders`);
 
-  const orderRows = rawOrders.flatMap((node) => {
+  const orderRows: (typeof saleorOrders.$inferInsert)[] = [];
+  // Line items are captured alongside the order rollup — denormalized at sync
+  // time (product/variant attributes snapshotted now) rather than joined live
+  // from a products table, so historical strain/THC data survives later
+  // re-tagging in Saleor. See docs/customer-health-index-deep-dive.md §2.1.
+  const lineRows: NewSaleorOrderLine[] = [];
+
+  for (const node of rawOrders) {
     const email = node.userEmail?.toLowerCase().trim();
-    if (!email) return [];
+    if (!email) continue; // skip lines too — FK requires the parent order to exist
     const totalGrams = node.weight?.value ?? null;
     const contactId = [...(node.metadata ?? []), ...(node.privateMetadata ?? [])]
       .find((m) => m.key === "contactId")?.value ?? null;
-    return [{
+
+    orderRows.push({
       sourceId: node.id,
       email,
       orderNumber: node.number,
@@ -216,9 +291,27 @@ export const handler: ScheduledHandler = async (_event) => {
       currency: node.total?.gross?.currency ?? null,
       contactId,
       orderedAt: new Date(node.created),
-    }];
-  });
-  console.log(`[saleor-sync] ${orderRows.length} orders to upsert`);
+    });
+
+    for (const line of node.lines ?? []) {
+      const variant = line.variant;
+      const unitGrams = weightToGrams(variant?.weight);
+      lineRows.push({
+        id: line.id,
+        orderId: node.id,
+        productId: variant?.product?.id ?? null,
+        productName: line.productName,
+        variantId: variant?.id ?? null,
+        variantName: line.variantName,
+        strain: findAttributeValue(variant?.product?.attributes, "Strain"),
+        thcLevel: findAttributeValue(variant?.product?.attributes, "THC Level"),
+        cut: findAttributeValue(variant?.attributes, "cut"),
+        grams: unitGrams != null ? String(unitGrams * line.quantity) : null,
+        quantity: line.quantity,
+      });
+    }
+  }
+  console.log(`[saleor-sync] ${orderRows.length} orders / ${lineRows.length} order lines to upsert`);
 
   let orderCount = 0;
   for (let i = 0; i < orderRows.length; i += BATCH) {
@@ -241,6 +334,32 @@ export const handler: ScheduledHandler = async (_event) => {
     orderCount += batch.length;
   }
   console.log(`[saleor-sync] orders upserted: ${orderCount}`);
+
+  let lineCount = 0;
+  for (let i = 0; i < lineRows.length; i += BATCH) {
+    const batch = lineRows.slice(i, i + BATCH);
+    await db
+      .insert(saleorOrderLines)
+      .values(batch)
+      .onConflictDoUpdate({
+        target: saleorOrderLines.id,
+        set: {
+          orderId: sql`excluded.order_id`,
+          productId: sql`excluded.product_id`,
+          productName: sql`excluded.product_name`,
+          variantId: sql`excluded.variant_id`,
+          variantName: sql`excluded.variant_name`,
+          strain: sql`excluded.strain`,
+          thcLevel: sql`excluded.thc_level`,
+          cut: sql`excluded.cut`,
+          grams: sql`excluded.grams`,
+          quantity: sql`excluded.quantity`,
+          syncedAt: sql`now()`,
+        },
+      });
+    lineCount += batch.length;
+  }
+  console.log(`[saleor-sync] order lines upserted: ${lineCount}`);
   console.log("[saleor-sync] done");
 };
 
