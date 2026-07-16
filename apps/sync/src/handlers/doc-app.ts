@@ -99,8 +99,6 @@ async function fetchSupplyTracking(): Promise<SupplyRow[]> {
       FROM user_login_supply_tracking
       WHERE email IS NOT NULL
         AND btrim(email) != ''
-        AND supply_interval_total IS NOT NULL
-        AND supply_interval_total > 0
     `;
   } finally {
     await conn.end();
