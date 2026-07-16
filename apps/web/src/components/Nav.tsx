@@ -11,6 +11,7 @@ const ALL_PAGES = [
     { path: "/zoho-health", label: "Zoho Health" },
     { path: "/shop-analytics", label: "Shop Analytics" },
     { path: "/patients", label: "Patients" },
+    { path: "/leads", label: "Lead Tracker" },
 ];
 
 export default function Nav() {

@@ -43,6 +43,13 @@ export const handler = async (): Promise<{ statusCode: number; body: string }> =
                 { path: "/zoho-health", label: "Zoho Health", sortOrder: 4 },
                 { path: "/shop-analytics", label: "Shop Analytics", sortOrder: 5 },
                 { path: "/patients", label: "Patient Registry", sortOrder: 6 },
+                { path: "/leads", label: "Lead Tracker", sortOrder: 7 },
+                { path: "/leads/stats", label: "Stats", sortOrder: 8 },
+                { path: "/leads/reg-funnel", label: "Reg. Funnel", sortOrder: 9 },
+                { path: "/leads/shop-funnel", label: "Shop Funnel", sortOrder: 10 },
+                { path: "/leads/leads-to-purchase", label: "Patient Journey", sortOrder: 11 },
+                { path: "/leads/campaign-funnel", label: "Campaigns", sortOrder: 12 },
+                { path: "/leads/bookings", label: "Bookings", sortOrder: 13 },
             ])
             .onConflictDoNothing();
 

@@ -1,0 +1,86 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens for the ported Lead Tracker section, tuned to visually match
+ * /health's flat, monochrome dark aesthetic (#0f0f0f bg, #141414 panels,
+ * #1a1a1a chip/button bg, #2a2a2a borders, no colorful "primary" CTA — every
+ * button/input/chip uses the same neutral ghost look, only semantic
+ * data badges (source/stage/adherence colors) stay colorful).
+ * Scoped to .leads-scope, not :root, so it can't leak into the rest of the
+ * app. Preflight is disabled in tailwind.config.ts for the same reason.
+ */
+.leads-scope {
+    --background: 0 0% 6%;
+    --foreground: 0 0% 91%;
+    --card: 0 0% 8%;
+    --card-foreground: 0 0% 91%;
+    --popover: 0 0% 10%;
+    --popover-foreground: 0 0% 91%;
+    --primary: 0 0% 10%;
+    --primary-foreground: 0 0% 91%;
+    --secondary: 0 0% 10%;
+    --secondary-foreground: 0 0% 67%;
+    --muted: 0 0% 10%;
+    --muted-foreground: 0 0% 40%;
+    --accent: 0 0% 14%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 16%;
+    --input: 0 0% 16%;
+    --ring: 0 0% 45%;
+    --radius: 0.5rem;
+}
+
+/*
+ * Preflight is disabled (see tailwind.config.ts) so the rest of analytics-mono
+ * isn't affected, but that also strips out preflight's `color: inherit` fix
+ * for native form controls — without it, <input>/<select>/<button> fall back
+ * to the browser's default (black) text color instead of inheriting
+ * .leads-scope's --foreground, making text invisible on the dark background.
+ * Re-apply just that one rule, scoped to .leads-scope.
+ */
+.leads-scope button,
+.leads-scope input,
+.leads-scope select,
+.leads-scope textarea {
+    color: inherit;
+}
+
+/*
+ * Preflight also normally resets <button>'s native platform appearance
+ * (macOS/Chrome renders unstyled buttons with a light gray/white beveled
+ * background and a blue focus ring). Any raw <button> in this scope that
+ * doesn't set its own bg-*/
+border-* utility classes was falling back to that * native chrome,
+showing as a white box against the dark theme. Reset * appearance/background/border here (as a base-layer rule so utility * classes like bg-secondary/border-input still win when present). */ @layer base {
+    .leads-scope button {
+        appearance: none;
+        -webkit-appearance: none;
+        background-color: transparent;
+        background-image: none;
+        border-width: 0;
+        border-style: solid;
+        outline: none;
+        cursor: pointer;
+    }
+}
+
+/*
+ * Native form controls default to the browser's light OS chrome (date-picker
+ * icon, checkbox tick box) which renders as a bright white beveled/3D
+ * element against .leads-scope's dark background. `color-scheme: dark` tells
+ * the browser to render that native chrome in dark colors instead, and
+ * `accent-color` flattens checkboxes to the same neutral tone used
+ * everywhere else instead of the default blue/white box.
+ */
+.leads-scope input[type="date"],
+.leads-scope input[type="checkbox"] {
+    color-scheme: dark;
+}
+
+.leads-scope input[type="checkbox"] {
+    accent-color: hsl(var(--foreground));
+}
