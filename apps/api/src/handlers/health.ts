@@ -1,9 +1,16 @@
 import type { APIGatewayProxyHandlerV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
 import { db } from "@analytics/db";
 import { sql } from "drizzle-orm";
+import {
+  fetchLivePatientHealthData,
+  buildMirrorTrackerSelectedCte,
+  MIRROR_ADHERENCE_PCT_SQL,
+  type LivePatientHealthRow,
+} from "../lib/docapp-db";
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MS_PER_DAY = 86_400_000;
 
 const GROUP_CRITERIA = {
   purple: [
@@ -72,374 +79,324 @@ function err(msg: string, status = 400): APIGatewayProxyStructuredResultV2 {
   return { statusCode: status, headers: CORS, body: JSON.stringify({ error: msg }) };
 }
 
-function buildHealthQuery(from?: string | null, to?: string | null) {
+/** Analytics-DB shop-engagement (cart_sessions-based conversion/visit metrics). */
+interface ShopEngagementRow {
+  email: string;
+  total_purchases: number | null;
+  purchase_rate_pct: number | null;
+}
+
+interface LastOrderRow {
+  email: string;
+  last_order_date: string | null;
+}
+
+function buildShopEngagementQuery(from?: string | null, to?: string | null) {
   const safeFrom = from && DATE_RE.test(from) ? from : null;
   const safeTo = to && DATE_RE.test(to) ? to : null;
-
-  const saleorFilter = safeFrom
-    ? `\n    AND ordered_at >= '${safeFrom}'${safeTo ? ` AND ordered_at < '${safeTo}'` : ""}`
-    : "";
   const cartFilter = safeFrom
-    ? `\n    AND source_created_at >= '${safeFrom}'${safeTo ? ` AND source_created_at < '${safeTo}'` : ""}`
+    ? `\n      AND source_created_at >= '${safeFrom}'${safeTo ? ` AND source_created_at < '${safeTo}'` : ""}`
     : "";
 
   return sql.raw(`
-  WITH
-  supply_by_interval AS (
-    SELECT DISTINCT ON (LOWER(TRIM(email)), interval_key)
-      LOWER(TRIM(email))                          AS email,
-      interval_key,
-      supply_interval_total     AS allotted_this_interval,
-      supply_used_interval      AS used_this_interval,
-      supply_remaining_interval AS remaining_this_interval,
-      supply_remaining_repeats  AS remaining_repeats_snapshot
-    FROM supply_tracking
-    WHERE email IS NOT NULL
-      AND supply_interval_total IS NOT NULL
-      AND supply_interval_total::numeric > 0
-    ORDER BY LOWER(TRIM(email)), interval_key, source_created_at DESC
-  ),
-  allowance_totals AS (
     SELECT
-      email,
-      COUNT(*)::int                                AS repeat_count,
-      SUM(allotted_this_interval::numeric)         AS allotted_g,
-      AVG(remaining_this_interval::numeric)        AS avg_remaining_g,
-      AVG(allotted_this_interval::numeric)         AS avg_allotted_g,
-      MIN(remaining_repeats_snapshot)              AS repeats_remaining
-    FROM supply_by_interval
-    GROUP BY email
-  ),
-  supply_engagement AS (
-    SELECT
-      email,
-      COUNT(*)                                                               AS total_visits,
-      ROUND(COUNT(*)::numeric / GREATEST(
-        EXTRACT(EPOCH FROM (NOW() - MIN(interval_key::date))) / (30.44 * 86400.0), 1
-      ), 1)                                                                  AS avg_visits_per_month,
-      CASE
-        WHEN COUNT(*) > 1 THEN
-          ROUND((MAX(interval_key::date) - MIN(interval_key::date))::numeric
-            / NULLIF(COUNT(*) - 1, 0), 1)
-        ELSE NULL
-      END                                                                    AS avg_days_between_visits,
-      MAX(interval_key::date)                                                AS last_visit
-    FROM supply_by_interval
-    GROUP BY email
-  ),
-  tracker_selected AS (
-    SELECT
-      LOWER(TRIM(tpt.email)) AS email,
-      tpt.repeats::numeric AS repeats,
-      tpt.script_expiration_date::date AS script_end_date,
-      CASE
-        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN 26
-        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN 29
-        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN 22
-        ELSE NULL
-      END AS strength,
-      CASE
-        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN tpt.supply_total_26::numeric
-        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN tpt.supply_total_29::numeric
-        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN tpt.supply_total_22::numeric
-        ELSE NULL
-      END AS supply_total_active,
-      CASE
-        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN tpt.supply_interval_total_26::numeric
-        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN tpt.supply_interval_total_29::numeric
-        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN tpt.supply_interval_total_22::numeric
-        ELSE NULL
-      END AS supply_interval_total_active,
-      CASE
-        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN tpt.repeats_remaining_26::numeric
-        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN tpt.repeats_remaining_29::numeric
-        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN tpt.repeats_remaining_22::numeric
-        ELSE NULL
-      END AS repeats_remaining_active
-    FROM db_treatment_plan_tracker tpt
-    WHERE tpt.email IS NOT NULL
-  ),
-  saleor_used AS (
-    SELECT
-      LOWER(TRIM(email))      AS email,
-      SUM(total_grams::numeric)  AS used_g,
-      COUNT(*)::int              AS order_count
-    FROM saleor_orders
-    WHERE email IS NOT NULL${saleorFilter}
-    GROUP BY LOWER(TRIM(email))
-  ),
-  order_weight_used AS (
-    SELECT
-      LOWER(TRIM(email)) AS email,
-      SUM(COALESCE(weight_22::numeric, 0)) AS used_22_g,
-      SUM(COALESCE(weight_26::numeric, 0)) AS used_26_g,
-      SUM(COALESCE(weight_29::numeric, 0)) AS used_29_g,
-      COUNT(*)::int                         AS order_count
-    FROM orders_dispatched
-    WHERE email IS NOT NULL
-    GROUP BY LOWER(TRIM(email))
-  ),
-  adherence_calc AS (
-    SELECT
-      ts.email,
-      ts.strength,
-      ts.repeats,
-      ts.supply_total_active,
-      ts.supply_interval_total_active,
-      ts.repeats_remaining_active,
-      ts.script_end_date,
-      LEAST(
-        GREATEST(COALESCE(ow.order_count, su.order_count, 0) - 1, 0),
-        GREATEST(COALESCE(ts.repeats, 0)::int - 1, 0)
-      )::numeric AS repeat_index,
-      COALESCE(
-        CASE ts.strength
-          WHEN 26 THEN NULLIF(ow.used_26_g, 0)
-          WHEN 29 THEN NULLIF(ow.used_29_g, 0)
-          WHEN 22 THEN NULLIF(ow.used_22_g, 0)
-          ELSE NULL
-        END,
-        su.used_g,
-        0
-      ) AS bought_g_resolved,
-      (ts.supply_total_active - (
-        LEAST(
-          GREATEST(COALESCE(ow.order_count, su.order_count, 0) - 1, 0),
-          GREATEST(COALESCE(ts.repeats, 0)::int - 1, 0)
-        )::numeric * ts.supply_interval_total_active
-      )) AS adherence_denominator,
-      CASE
-        WHEN ts.supply_total_active IS NULL
-          OR ts.supply_interval_total_active IS NULL
-          OR (ts.supply_total_active - (
-            LEAST(
-              GREATEST(COALESCE(ow.order_count, su.order_count, 0) - 1, 0),
-              GREATEST(COALESCE(ts.repeats, 0)::int - 1, 0)
-            )::numeric * ts.supply_interval_total_active
-          )) <= 0
-          THEN NULL
-        ELSE (
-          COALESCE(
-            CASE ts.strength
-              WHEN 26 THEN NULLIF(ow.used_26_g, 0)
-              WHEN 29 THEN NULLIF(ow.used_29_g, 0)
-              WHEN 22 THEN NULLIF(ow.used_22_g, 0)
-              ELSE NULL
-            END,
-            su.used_g,
-            0
-          )
-          / NULLIF((ts.supply_total_active - (
-            LEAST(
-              GREATEST(COALESCE(ow.order_count, su.order_count, 0) - 1, 0),
-              GREATEST(COALESCE(ts.repeats, 0)::int - 1, 0)
-            )::numeric * ts.supply_interval_total_active
-          )), 0)
-        )
-      END AS adherence_ratio
-    FROM tracker_selected ts
-    LEFT JOIN order_weight_used ow ON ow.email = ts.email
-    LEFT JOIN saleor_used su ON su.email = ts.email
-  ),
-  shop_engagement AS (
-    SELECT
-      LOWER(TRIM(email))                                                     AS email,
-      COUNT(*)                                                             AS total_visits,
-      COUNT(*) FILTER (WHERE is_converted = true)                         AS total_purchases,
-      ROUND(COUNT(*) FILTER (WHERE is_converted = true)::numeric / NULLIF(COUNT(*), 0) * 100, 1) AS purchase_rate_pct,
-      ROUND(COUNT(*)::numeric / GREATEST(
-        EXTRACT(EPOCH FROM (NOW() - MIN(source_created_at))) / (30.44 * 86400.0), 1
-      ), 1)                                                                AS avg_visits_per_month,
-      CASE
-        WHEN COUNT(*) > 1 THEN
-          ROUND(EXTRACT(EPOCH FROM (MAX(source_created_at) - MIN(source_created_at))) / 86400.0
-            / NULLIF(COUNT(*) - 1, 0), 1)
-        ELSE NULL
-      END                                                                  AS avg_days_between_visits,
-      (MAX(source_created_at) AT TIME ZONE 'Australia/Sydney')::date       AS last_visit
+      LOWER(TRIM(email))                                                                                AS email,
+      COUNT(*) FILTER (WHERE is_converted = true)                                                       AS total_purchases,
+      ROUND(COUNT(*) FILTER (WHERE is_converted = true)::numeric / NULLIF(COUNT(*), 0) * 100, 1)         AS purchase_rate_pct
     FROM cart_sessions
     WHERE is_deleted = false AND email IS NOT NULL${cartFilter}
     GROUP BY LOWER(TRIM(email))
-  ),
-  last_order AS (
+  `);
+}
+
+function buildLastOrderQuery() {
+  return sql.raw(`
     SELECT
-      LOWER(TRIM(email)) AS email,
-      MAX(COALESCE(order_date::date, source_created_at::date)) AS last_order_date
+      LOWER(TRIM(email))                                        AS email,
+      MAX(COALESCE(order_date::date, source_created_at::date))  AS last_order_date
     FROM orders_dispatched
     WHERE email IS NOT NULL
     GROUP BY LOWER(TRIM(email))
-  )
-  SELECT * FROM (
-  SELECT
-    c.name                                                                 AS patient_name,
-    zc.email                                                               AS email,
-    (c.created_at AT TIME ZONE 'Australia/Sydney')::date                  AS signed_up,
-    COALESCE(tpt.script_expiration_date::date, ac.script_end_date)         AS script_end_date,
-    COALESCE(
-      tpt.repeats,
-      ac.repeats::int,
-      at.repeat_count
-    )                                                                      AS repeat_count,
-    COALESCE(
-      CASE
-        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN tpt.repeats_remaining_26::numeric
-        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN tpt.repeats_remaining_29::numeric
-        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN tpt.repeats_remaining_22::numeric
-        ELSE NULL
-      END,
-      ac.repeats_remaining_active,
-      at.repeats_remaining::numeric
-    )                                                                      AS repeats_remaining,
-    ROUND(COALESCE(
-      CASE
-        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN tpt.supply_total_26::numeric
-        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN tpt.supply_total_29::numeric
-        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN tpt.supply_total_22::numeric
-        ELSE NULL
-      END,
-      ac.supply_total_active,
-      at.allotted_g
-    ), 1)                                                                  AS allotted_g,
-    ROUND(COALESCE(
-      CASE
-        WHEN COALESCE(tpt.supply_total_26::numeric, 0) > 0 THEN NULLIF(ow.used_26_g, 0)
-        WHEN COALESCE(tpt.supply_total_29::numeric, 0) > 0 THEN NULLIF(ow.used_29_g, 0)
-        WHEN COALESCE(tpt.supply_total_22::numeric, 0) > 0 THEN NULLIF(ow.used_22_g, 0)
-        ELSE NULL
-      END,
-      ac.bought_g_resolved,
-      su.used_g,
-      0
-    ), 1)                                                                  AS bought_g,
-    ROUND(at.avg_remaining_g, 1)                                          AS avg_remaining_g,
-    ROUND(
-      LEAST(
-        COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)),
-        1
-      ) * 100,
-      1
-    )                                                                      AS adherence_pct,
-    ROUND(COALESCE(su.used_g, 0), 1)                                      AS saleor_total_g,
-    at.avg_allotted_g,
-    COALESCE(lo.last_order_date, se.last_visit)                            AS last_activity_date,
-    (
-      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
-      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) < 25
-    )                                                                      AS is_red_low_grams,
-    (
-      COALESCE(lo.last_order_date, se.last_visit) IS NULL
-      OR COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '90 days'
-    )                                                                      AS is_red_no_purchase_90,
-    (
-      tpt.script_expiration_date IS NOT NULL
-      AND tpt.script_expiration_date::date < CURRENT_DATE - INTERVAL '60 days'
-    )                                                                      AS is_red_consultation_overdue_60,
-    (
-      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
-      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 25 AND 50
-    )                                                                      AS is_orange_grams_25_50,
-    (
-      COALESCE(lo.last_order_date, se.last_visit) < CURRENT_DATE - INTERVAL '45 days'
-      AND COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '90 days'
-    )                                                                      AS is_orange_no_purchase_46_90,
-    (
-      tpt.needs_update = true
-      OR (
-        tpt.script_expiration_date IS NOT NULL
-        AND tpt.script_expiration_date::date BETWEEN CURRENT_DATE - INTERVAL '60 days' AND CURRENT_DATE
-      )
-    )                                                                      AS is_orange_consultation_due,
-    (
-      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
-      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 75 AND 110
-    )                                                                      AS is_purple_grams_75_110,
-    (
-      COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '30 days'
-    )                                                                      AS is_purple_recent_purchase_30,
-    (COALESCE(at.repeat_count, 0) >= 3)                                    AS is_purple_repeat_count_3,
-    (
-      (tpt.needs_update IS NULL OR tpt.needs_update = false)
-      AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE)
-    )                                                                      AS is_purple_consultation_current,
-    (
-      COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NOT NULL
-      AND ROUND(COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) * 100, 1) BETWEEN 50 AND 75
-    )                                                                      AS is_green_grams_50_75,
-    (
-      COALESCE(lo.last_order_date, se.last_visit) >= CURRENT_DATE - INTERVAL '45 days'
-    )                                                                      AS is_green_recent_purchase_45,
-    (
-      (tpt.needs_update IS NULL OR tpt.needs_update = false)
-      AND (tpt.script_expiration_date IS NULL OR tpt.script_expiration_date::date > CURRENT_DATE)
-    )                                                                      AS is_green_consultation_current,
-    CASE
-      -- No supply plan
-      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
-        AND zc.supply_date IS NOT NULL THEN 'red'
-      WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL THEN NULL
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
-         AND COALESCE(ac.repeats::int, at.repeat_count, 0) >= 3
-         AND COALESCE(se.purchase_rate_pct, 100) >= 60 THEN 'purple'
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.50 THEN 'green'
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.25 THEN 'orange'
-      ELSE 'red'
-    END                                                                    AS adherence_group,
-    supe.total_visits, se.total_purchases, se.purchase_rate_pct,
-    supe.avg_visits_per_month, supe.avg_days_between_visits, supe.last_visit,
-    CASE
-      WHEN supe.avg_visits_per_month >= 4   THEN 'frequent'
-      WHEN supe.avg_visits_per_month >= 1   THEN 'occasional'
-      WHEN supe.avg_visits_per_month IS NOT NULL THEN 'rare'
-      ELSE NULL
-    END AS visit_tier,
-    CASE
-      WHEN se.purchase_rate_pct >= 60 THEN 'high_converter'
-      WHEN se.purchase_rate_pct >= 30 THEN 'moderate_converter'
-      WHEN se.purchase_rate_pct IS NOT NULL THEN 'low_converter'
-      ELSE NULL
-    END AS conversion_tier,
-    CASE
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75
-           AND supe.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60 THEN 'loyal_power_buyer'
-       WHEN COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) >= 0.75 THEN 'high_adherent'
-      WHEN supe.avg_visits_per_month >= 4 AND se.purchase_rate_pct >= 60
-         AND (
-           COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
-           OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.75
-         ) THEN 'active_partial_buyer'
-      WHEN supe.avg_visits_per_month >= 2 AND se.purchase_rate_pct < 30    THEN 'window_shopper'
-      WHEN supe.avg_visits_per_month >= 1 AND se.purchase_rate_pct >= 30   THEN 'casual_buyer'
-      WHEN (supe.avg_visits_per_month < 1 OR supe.avg_visits_per_month IS NULL)
-         AND (
-           COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) IS NULL
-           OR COALESCE(ac.adherence_ratio, COALESCE(su.used_g, 0) / NULLIF(at.allotted_g, 0)) < 0.25
-         ) THEN 'at_risk'
-      ELSE 'needs_review'
-    END AS customer_pattern,
-    lo.last_order_date AS last_order_date
-  FROM zoho_contacts zc
-  LEFT JOIN tracker_selected tps ON tps.email = LOWER(TRIM(zc.email))
-  LEFT JOIN allowance_totals at  ON at.email  = LOWER(TRIM(zc.email)) AND tps.strength IS NULL
-  LEFT JOIN saleor_used      su  ON su.email  = LOWER(TRIM(zc.email))
-  LEFT JOIN shop_engagement   se   ON se.email   = LOWER(TRIM(zc.email))
-  LEFT JOIN supply_engagement  supe ON supe.email = LOWER(TRIM(zc.email))
-  LEFT JOIN customers          c    ON LOWER(TRIM(c.email)) = LOWER(TRIM(zc.email))
-  LEFT JOIN adherence_calc   ac  ON ac.email  = LOWER(TRIM(zc.email))
-  LEFT JOIN order_weight_used ow ON ow.email  = LOWER(TRIM(zc.email))
-  LEFT JOIN last_order       lo  ON lo.email  = LOWER(TRIM(zc.email))
-  LEFT JOIN db_treatment_plan_tracker tpt ON LOWER(TRIM(tpt.email)) = LOWER(TRIM(zc.email))
-  WHERE zc.email IS NOT NULL AND TRIM(zc.email) <> ''
-) _health
-ORDER BY
-  CASE adherence_group
-    WHEN 'purple' THEN 1
-    WHEN 'green'  THEN 2
-    WHEN 'orange' THEN 3
-    WHEN 'red'    THEN 4
-    ELSE 5
-  END,
-  COALESCE(last_order_date, last_visit) DESC NULLS LAST
-`);
+  `);
+}
+
+/**
+ * Analytics-DB mirror fallback for the patient + tracker + visit dataset,
+ * used only when the live doc-app connection (DOCAPP_DATABASE_URL) fails.
+ * Produces the same row shape as fetchLivePatientHealthData() so downstream
+ * merge/computation logic is source-agnostic.
+ */
+function buildMirrorPatientHealthQuery() {
+  return sql.raw(`
+    WITH
+    population AS (
+      SELECT
+        LOWER(TRIM(dp.email))        AS email,
+        dp.full_name                 AS patient_name,
+        dp.source_created_at::date   AS signed_up
+      FROM db_patients dp
+      WHERE dp.contact_id IS NOT NULL
+        AND dp.email IS NOT NULL
+        AND TRIM(dp.email) <> ''
+    ),
+    ${buildMirrorTrackerSelectedCte("db_treatment_plan_tracker", "needs_update")},
+    supply_by_interval AS (
+      SELECT DISTINCT ON (LOWER(TRIM(email)), interval_key)
+        LOWER(TRIM(email))        AS email,
+        interval_key,
+        supply_remaining_interval
+      FROM supply_tracking
+      WHERE email IS NOT NULL
+        AND LOWER(TRIM(email)) IN (SELECT email FROM population)
+      ORDER BY LOWER(TRIM(email)), interval_key, source_created_at DESC
+    ),
+    visit_stats AS (
+      SELECT
+        email,
+        COUNT(*)                                       AS total_visits,
+        AVG(supply_remaining_interval::numeric)         AS avg_remaining_g,
+        ROUND(COUNT(*)::numeric / GREATEST(
+          EXTRACT(EPOCH FROM (NOW() - MIN(interval_key::date))) / (30.44 * 86400.0), 1
+        ), 1)                                           AS avg_visits_per_month,
+        CASE
+          WHEN COUNT(*) > 1 THEN
+            ROUND((MAX(interval_key::date) - MIN(interval_key::date))::numeric
+              / NULLIF(COUNT(*) - 1, 0), 1)
+          ELSE NULL
+        END                                             AS avg_days_between_visits,
+        MAX(interval_key::date)                         AS last_visit
+      FROM supply_by_interval
+      GROUP BY email
+    )
+    SELECT
+      p.email,
+      p.patient_name,
+      p.signed_up,
+      ts.repeats,
+      ts.script_expiration_date,
+      ts.needs_update,
+      ts.strength,
+      ts.supply_total_active,
+      ts.supply_interval_total_active,
+      ts.supply_used_total_active,
+      ts.repeats_remaining_active,
+      ROUND((ts.supply_interval_total_active * ts.repeats)::numeric, 1)   AS alloted_g,
+      ROUND(COALESCE(ts.supply_used_total_active, 0)::numeric, 1)        AS bought_g,
+      ${MIRROR_ADHERENCE_PCT_SQL} AS adherence_pct,
+      ROUND(vs.avg_remaining_g::numeric, 1)                             AS avg_remaining_g,
+      COALESCE(vs.total_visits, 0)                                      AS total_visits,
+      vs.avg_visits_per_month,
+      vs.avg_days_between_visits,
+      vs.last_visit
+    FROM population p
+    LEFT JOIN tracker_selected ts ON ts.email = p.email
+    LEFT JOIN visit_stats      vs ON vs.email = p.email
+  `);
+}
+
+function daysSince(dateLike: string | Date | null | undefined): number | null {
+  if (!dateLike) return null;
+  const t = dateLike instanceof Date ? dateLike.getTime() : new Date(dateLike).getTime();
+  if (Number.isNaN(t)) return null;
+  return (Date.now() - t) / MS_PER_DAY;
+}
+
+interface ComputedHealthRow {
+  patient_name: string | null;
+  email: string;
+  signed_up: string | null;
+  script_end_date: string | null;
+  repeat_count: number | null;
+  repeats_remaining: number | null;
+  allotted_g: number | null;
+  bought_g: number | null;
+  avg_remaining_g: number | null;
+  adherence_pct: number | null;
+  adherence_group: string | null;
+  total_visits: number;
+  total_purchases: number | null;
+  purchase_rate_pct: number | null;
+  avg_visits_per_month: number | null;
+  avg_days_between_visits: number | null;
+  last_visit: string | null;
+  visit_tier: string | null;
+  conversion_tier: string | null;
+  customer_pattern: string;
+  is_red_low_grams: boolean;
+  is_red_no_purchase_90: boolean;
+  is_red_consultation_overdue_60: boolean;
+  is_orange_grams_25_50: boolean;
+  is_orange_no_purchase_46_90: boolean;
+  is_orange_consultation_due: boolean;
+  is_purple_grams_75_110: boolean;
+  is_purple_recent_purchase_30: boolean;
+  is_purple_repeat_count_3: boolean;
+  is_purple_consultation_current: boolean;
+  is_green_grams_50_75: boolean;
+  is_green_recent_purchase_45: boolean;
+  is_green_consultation_current: boolean;
+}
+
+/**
+ * Merges one patient row (live doc-app or mirror fallback, same shape) with
+ * the analytics-DB shop-engagement / last-order data and computes every
+ * GROUP_CRITERIA flag + tier field the old SQL used to compute in-database.
+ */
+function computeHealthRow(
+  patient: LivePatientHealthRow,
+  shop: ShopEngagementRow | undefined,
+  lastOrder: LastOrderRow | undefined,
+): ComputedHealthRow {
+  const adherencePct = patient.adherence_pct != null ? Number(patient.adherence_pct) : null;
+  const hasPlan = patient.repeats != null || patient.supply_total_active != null;
+  const repeatCount = patient.repeats != null ? Number(patient.repeats) : null;
+  const purchaseRatePct = shop?.purchase_rate_pct != null ? Number(shop.purchase_rate_pct) : null;
+  const avgVisitsPerMonth = patient.avg_visits_per_month != null ? Number(patient.avg_visits_per_month) : null;
+
+  const lastActivityDate = lastOrder?.last_order_date ?? patient.last_visit ?? null;
+  const daysSinceActivity = daysSince(lastActivityDate);
+  const daysOverdue = daysSince(patient.script_expiration_date); // positive = past expiration
+
+  const isRedLowGrams = adherencePct != null && adherencePct < 25;
+  const isRedNoPurchase90 = daysSinceActivity == null || daysSinceActivity > 90;
+  const isRedConsultationOverdue60 = daysOverdue != null && daysOverdue > 60;
+
+  const isOrangeGrams2550 = adherencePct != null && adherencePct >= 25 && adherencePct <= 50;
+  const isOrangeNoPurchase4690 = daysSinceActivity != null && daysSinceActivity > 45 && daysSinceActivity <= 90;
+  const isOrangeConsultationDue =
+    Boolean(patient.needs_update) || (daysOverdue != null && daysOverdue >= 0 && daysOverdue <= 60);
+
+  const isPurpleGrams75110 = adherencePct != null && adherencePct >= 75 && adherencePct <= 110;
+  const isPurpleRecentPurchase30 = daysSinceActivity != null && daysSinceActivity <= 30;
+  const isPurpleRepeatCount3 = (repeatCount ?? 0) >= 3;
+  const consultationCurrent = !patient.needs_update && (daysOverdue == null || daysOverdue < 0);
+
+  const isGreenGrams5075 = adherencePct != null && adherencePct >= 50 && adherencePct <= 75;
+  const isGreenRecentPurchase45 = daysSinceActivity != null && daysSinceActivity <= 45;
+
+  let adherenceGroup: string | null;
+  if (adherencePct == null) {
+    adherenceGroup = hasPlan ? "red" : null;
+  } else if (adherencePct >= 75 && (repeatCount ?? 0) >= 3 && (purchaseRatePct ?? 100) >= 60) {
+    adherenceGroup = "purple";
+  } else if (adherencePct >= 50) {
+    adherenceGroup = "green";
+  } else if (adherencePct >= 25) {
+    adherenceGroup = "orange";
+  } else {
+    adherenceGroup = "red";
+  }
+
+  let visitTier: string | null;
+  if (avgVisitsPerMonth == null) visitTier = null;
+  else if (avgVisitsPerMonth >= 4) visitTier = "frequent";
+  else if (avgVisitsPerMonth >= 1) visitTier = "occasional";
+  else visitTier = "rare";
+
+  let conversionTier: string | null;
+  if (purchaseRatePct == null) conversionTier = null;
+  else if (purchaseRatePct >= 60) conversionTier = "high_converter";
+  else if (purchaseRatePct >= 30) conversionTier = "moderate_converter";
+  else conversionTier = "low_converter";
+
+  let customerPattern: string;
+  if (adherencePct != null && adherencePct >= 75 && (avgVisitsPerMonth ?? 0) >= 4 && (purchaseRatePct ?? 0) >= 60) {
+    customerPattern = "loyal_power_buyer";
+  } else if (adherencePct != null && adherencePct >= 75) {
+    customerPattern = "high_adherent";
+  } else if (
+    (avgVisitsPerMonth ?? 0) >= 4 &&
+    (purchaseRatePct ?? 0) >= 60 &&
+    (adherencePct == null || adherencePct < 75)
+  ) {
+    customerPattern = "active_partial_buyer";
+  } else if ((avgVisitsPerMonth ?? 0) >= 2 && purchaseRatePct != null && purchaseRatePct < 30) {
+    customerPattern = "window_shopper";
+  } else if ((avgVisitsPerMonth ?? 0) >= 1 && (purchaseRatePct ?? 0) >= 30) {
+    customerPattern = "casual_buyer";
+  } else if ((avgVisitsPerMonth ?? 0) < 1 && (adherencePct == null || adherencePct < 25)) {
+    customerPattern = "at_risk";
+  } else {
+    customerPattern = "needs_review";
+  }
+
+  return {
+    patient_name: patient.patient_name,
+    email: patient.email,
+    signed_up: patient.signed_up,
+    script_end_date: patient.script_expiration_date,
+    repeat_count: repeatCount,
+    repeats_remaining: patient.repeats_remaining_active != null ? Number(patient.repeats_remaining_active) : null,
+    allotted_g: patient.alloted_g != null ? Number(patient.alloted_g) : null,
+    bought_g: patient.bought_g != null ? Number(patient.bought_g) : null,
+    avg_remaining_g: patient.avg_remaining_g != null ? Number(patient.avg_remaining_g) : null,
+    adherence_pct: adherencePct,
+    adherence_group: adherenceGroup,
+    total_visits: patient.total_visits ?? 0,
+    total_purchases: shop?.total_purchases ?? null,
+    purchase_rate_pct: purchaseRatePct,
+    avg_visits_per_month: avgVisitsPerMonth,
+    avg_days_between_visits: patient.avg_days_between_visits != null ? Number(patient.avg_days_between_visits) : null,
+    last_visit: patient.last_visit,
+    visit_tier: visitTier,
+    conversion_tier: conversionTier,
+    customer_pattern: customerPattern,
+    is_red_low_grams: isRedLowGrams,
+    is_red_no_purchase_90: isRedNoPurchase90,
+    is_red_consultation_overdue_60: isRedConsultationOverdue60,
+    is_orange_grams_25_50: isOrangeGrams2550,
+    is_orange_no_purchase_46_90: isOrangeNoPurchase4690,
+    is_orange_consultation_due: isOrangeConsultationDue,
+    is_purple_grams_75_110: isPurpleGrams75110,
+    is_purple_recent_purchase_30: isPurpleRecentPurchase30,
+    is_purple_repeat_count_3: isPurpleRepeatCount3,
+    is_purple_consultation_current: consultationCurrent,
+    is_green_grams_50_75: isGreenGrams5075,
+    is_green_recent_purchase_45: isGreenRecentPurchase45,
+    is_green_consultation_current: consultationCurrent,
+  };
+}
+
+/**
+ * Fetches patient rows from the live doc-app DB, falling back to the
+ * analytics-DB mirror if the live connection fails for any reason.
+ * Returns the merged, fully-computed health rows plus a `stale` flag.
+ */
+async function loadHealthRows(
+  from?: string | null,
+  to?: string | null,
+): Promise<{ rows: ComputedHealthRow[]; stale: boolean }> {
+  let stale = false;
+  let patientRows: LivePatientHealthRow[];
+  try {
+    patientRows = await fetchLivePatientHealthData();
+  } catch (e) {
+    console.warn("[health] live doc-app fetch failed, falling back to analytics-DB mirror:", e);
+    stale = true;
+    patientRows = toRows<LivePatientHealthRow>(await db.execute(buildMirrorPatientHealthQuery()));
+  }
+
+  const [shopResult, lastOrderResult] = await Promise.all([
+    db.execute(buildShopEngagementQuery(from, to)),
+    db.execute(buildLastOrderQuery()),
+  ]);
+  const shopByEmail = new Map(toRows<ShopEngagementRow>(shopResult).map((r) => [r.email, r]));
+  const lastOrderByEmail = new Map(toRows<LastOrderRow>(lastOrderResult).map((r) => [r.email, r]));
+
+  const rows = patientRows.map((patient) =>
+    computeHealthRow(patient, shopByEmail.get(patient.email), lastOrderByEmail.get(patient.email)),
+  );
+
+  rows.sort((a, b) => {
+    const rank = (g: string | null) => (g === "purple" ? 1 : g === "green" ? 2 : g === "orange" ? 3 : g === "red" ? 4 : 5);
+    const diff = rank(a.adherence_group) - rank(b.adherence_group);
+    if (diff !== 0) return diff;
+    const aDate = a.last_visit ? new Date(a.last_visit).getTime() : -Infinity;
+    const bDate = b.last_visit ? new Date(b.last_visit).getTime() : -Infinity;
+    return bDate - aDate;
+  });
+
+  return { rows, stale };
 }
 
 export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatewayProxyStructuredResultV2> => {
@@ -449,16 +406,21 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
   try {
     // GET /health-data
     if (routeKey === "GET /health-data") {
-      const rows = toRows<RawHealthRow>(await db.execute(buildHealthQuery(qs.from, qs.to)));
-      const enriched = enrichHealthRows(rows);
-      return ok({ rows: enriched.rows, count: enriched.rows.length, criteriaCountsByGroup: enriched.criteriaCountsByGroup });
+      const { rows, stale } = await loadHealthRows(qs.from, qs.to);
+      const enriched = enrichHealthRows(rows as unknown as RawHealthRow[]);
+      return ok({
+        rows: enriched.rows,
+        count: enriched.rows.length,
+        criteriaCountsByGroup: enriched.criteriaCountsByGroup,
+        stale,
+      });
     }
 
     // GET /health-data/export
     if (routeKey === "GET /health-data/export") {
-      const rows = toRows(await db.execute(buildHealthQuery(qs.from, qs.to)));
+      const { rows } = await loadHealthRows(qs.from, qs.to);
       const group = qs.group?.trim();
-      const filtered = group === "noplan" ? rows.filter((r: Record<string, unknown>) => r.adherence_group == null) : rows;
+      const filtered = group === "noplan" ? rows.filter((r) => r.adherence_group == null) : rows;
 
       const cols: [string, string][] = [
         ["patient_name", "Patient Name"], ["email", "Email"], ["adherence_group", "Group"],
@@ -473,7 +435,9 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
         return s.includes(",") || s.includes('"') || s.includes("\n") ? `"${s.replace(/"/g, '""')}"` : s;
       };
       const header = cols.map(([, label]) => label).join(",");
-      const body = (filtered as Record<string, unknown>[]).map((r) => cols.map(([key]) => escape(r[key])).join(",")).join("\n");
+      const body = filtered
+        .map((r) => cols.map(([key]) => escape((r as unknown as Record<string, unknown>)[key])).join(","))
+        .join("\n");
       const filename = group === "noplan" ? "no-plan-contacts.csv" : "health-contacts.csv";
       return {
         statusCode: 200,
