@@ -128,17 +128,21 @@ function buildLastOrderQuery() {
 
 /** Analytics-DB (Saleor sync mirror) total grams bought, all-time — used as a
  *  fallback source for `bought_g` when doc-app's own tracker hasn't recorded
- *  any usage (supply_used_total_active is 0/null) for a patient. */
+ *  any usage (supply_used_total_active is 0/null) for a patient, and for
+ *  `last_visit` when doc-app has no recorded visit but the patient has a
+ *  Saleor order on file. */
 interface SaleorGramsRow {
   email: string;
   total_grams: number | null;
+  last_order_date: string | null;
 }
 
 function buildSaleorGramsQuery() {
   return sql.raw(`
     SELECT
       LOWER(TRIM(email))       AS email,
-      SUM(total_grams)         AS total_grams
+      SUM(total_grams)         AS total_grams,
+      MAX(ordered_at)::date    AS last_order_date
     FROM saleor_orders
     WHERE email IS NOT NULL
     GROUP BY LOWER(TRIM(email))
@@ -310,7 +314,11 @@ function computeHealthRow(
   const purchaseRatePct = shop?.purchase_rate_pct != null ? Number(shop.purchase_rate_pct) : null;
   const avgVisitsPerMonth = patient.avg_visits_per_month != null ? Number(patient.avg_visits_per_month) : null;
 
-  const lastActivityDate = lastOrder?.last_order_date ?? patient.last_visit ?? null;
+  // Doc-app has no visit recorded for some patients even though they've
+  // placed a Saleor order — fall back to their most recent Saleor order date.
+  const lastVisit = patient.last_visit ?? saleorGrams?.last_order_date ?? null;
+
+  const lastActivityDate = lastOrder?.last_order_date ?? lastVisit;
   const daysSinceActivity = daysSince(lastActivityDate);
   const daysOverdue = daysSince(patient.script_expiration_date); // positive = past expiration
 
@@ -394,7 +402,7 @@ function computeHealthRow(
     purchase_rate_pct: purchaseRatePct,
     avg_visits_per_month: avgVisitsPerMonth,
     avg_days_between_visits: patient.avg_days_between_visits != null ? Number(patient.avg_days_between_visits) : null,
-    last_visit: patient.last_visit,
+    last_visit: lastVisit,
     visit_tier: visitTier,
     conversion_tier: conversionTier,
     customer_pattern: customerPattern,
