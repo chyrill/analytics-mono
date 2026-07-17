@@ -294,12 +294,12 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
       },
       current_plan: currentPlan
         ? {
-            outcome: currentPlan.outcome,
-            date: currentPlan.date,
-            type: currentPlan.type,
-            diagnosis: currentPlan.diagnosis,
-            active_strength: activePlanStrength,
-          }
+          outcome: currentPlan.outcome,
+          date: currentPlan.date,
+          type: currentPlan.type,
+          diagnosis: currentPlan.diagnosis,
+          active_strength: activePlanStrength,
+        }
         : null,
       allowance: {
         repeats: allowance?.repeats ?? null,

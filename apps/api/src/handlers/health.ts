@@ -126,6 +126,39 @@ function buildLastOrderQuery() {
   `);
 }
 
+/** Analytics-DB (Saleor sync mirror) total grams bought, all-time — used as a
+ *  fallback source for `bought_g` when doc-app's own tracker hasn't recorded
+ *  any usage (supply_used_total_active is 0/null) for a patient. */
+interface SaleorGramsRow {
+  email: string;
+  total_grams: number | null;
+}
+
+function buildSaleorGramsQuery() {
+  return sql.raw(`
+    SELECT
+      LOWER(TRIM(email))       AS email,
+      SUM(total_grams)         AS total_grams
+    FROM saleor_orders
+    WHERE email IS NOT NULL
+    GROUP BY LOWER(TRIM(email))
+  `);
+}
+
+/** Mirrors docapp-db.ts's ADHERENCE_PCT_SQL, applied in application code when
+ *  `bought_g` has been swapped for the Saleor-sourced figure below. */
+function computeAdherencePct(
+  boughtG: number | null,
+  repeats: number | null,
+  repeatsRemainingActive: number | null,
+  supplyIntervalTotalActive: number | null,
+): number | null {
+  if (repeats == null || supplyIntervalTotalActive == null) return null;
+  const denominator = (repeats - ((repeatsRemainingActive ?? 0) - 1)) * supplyIntervalTotalActive;
+  if (denominator <= 0) return null;
+  return Math.round(Math.min((boughtG ?? 0) / denominator, 1) * 1000) / 10;
+}
+
 /**
  * Analytics-DB mirror fallback for the patient + tracker + visit dataset,
  * used only when the live doc-app connection (DOCAPP_DATABASE_URL) fails.
@@ -252,8 +285,26 @@ function computeHealthRow(
   patient: LivePatientHealthRow,
   shop: ShopEngagementRow | undefined,
   lastOrder: LastOrderRow | undefined,
+  saleorGrams: SaleorGramsRow | undefined,
 ): ComputedHealthRow {
-  const adherencePct = patient.adherence_pct != null ? Number(patient.adherence_pct) : null;
+  // doc-app's tracker can under-report grams bought (usage not recorded
+  // there) even though the patient has real Saleor purchase history —
+  // whenever Saleor's total exceeds the tracker's, trust Saleor instead and
+  // recompute adherence_pct off of it (doc-app's precomputed adherence_pct
+  // would otherwise still be based on the smaller tracker figure).
+  const docAppBoughtG = patient.bought_g != null ? Number(patient.bought_g) : null;
+  const saleorBoughtG = saleorGrams?.total_grams != null ? Number(saleorGrams.total_grams) : null;
+  const useSaleorBoughtG = saleorBoughtG != null && saleorBoughtG > (docAppBoughtG ?? 0);
+  const boughtG = useSaleorBoughtG ? saleorBoughtG : docAppBoughtG;
+
+  const adherencePct = useSaleorBoughtG
+    ? computeAdherencePct(
+        boughtG,
+        patient.repeats != null ? Number(patient.repeats) : null,
+        patient.repeats_remaining_active != null ? Number(patient.repeats_remaining_active) : null,
+        patient.supply_interval_total_active != null ? Number(patient.supply_interval_total_active) : null,
+      )
+    : patient.adherence_pct != null ? Number(patient.adherence_pct) : null;
   const hasPlan = patient.repeats != null || patient.supply_total_active != null;
   const repeatCount = patient.repeats != null ? Number(patient.repeats) : null;
   const purchaseRatePct = shop?.purchase_rate_pct != null ? Number(shop.purchase_rate_pct) : null;
@@ -334,7 +385,7 @@ function computeHealthRow(
     repeat_count: repeatCount,
     repeats_remaining: patient.repeats_remaining_active != null ? Number(patient.repeats_remaining_active) : null,
     allotted_g: patient.alloted_g != null ? Number(patient.alloted_g) : null,
-    bought_g: patient.bought_g != null ? Number(patient.bought_g) : null,
+    bought_g: boughtG,
     avg_remaining_g: patient.avg_remaining_g != null ? Number(patient.avg_remaining_g) : null,
     adherence_pct: adherencePct,
     adherence_group: adherenceGroup,
@@ -382,15 +433,22 @@ async function loadHealthRows(
     patientRows = toRows<LivePatientHealthRow>(await db.execute(buildMirrorPatientHealthQuery()));
   }
 
-  const [shopResult, lastOrderResult] = await Promise.all([
+  const [shopResult, lastOrderResult, saleorGramsResult] = await Promise.all([
     db.execute(buildShopEngagementQuery(from, to)),
     db.execute(buildLastOrderQuery()),
+    db.execute(buildSaleorGramsQuery()),
   ]);
   const shopByEmail = new Map(toRows<ShopEngagementRow>(shopResult).map((r) => [r.email, r]));
   const lastOrderByEmail = new Map(toRows<LastOrderRow>(lastOrderResult).map((r) => [r.email, r]));
+  const saleorGramsByEmail = new Map(toRows<SaleorGramsRow>(saleorGramsResult).map((r) => [r.email, r]));
 
   const rows = patientRows.map((patient) =>
-    computeHealthRow(patient, shopByEmail.get(patient.email), lastOrderByEmail.get(patient.email)),
+    computeHealthRow(
+      patient,
+      shopByEmail.get(patient.email),
+      lastOrderByEmail.get(patient.email),
+      saleorGramsByEmail.get(patient.email),
+    ),
   );
 
   rows.sort((a, b) => {
@@ -413,7 +471,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
     // GET /patient-orders-detail — delegated to patient-detail.ts's handler
     // (bundled into this same Lambda; see import comment above).
     if (routeKey === "GET /patient-orders-detail") {
-      return patientOrdersDetailHandler(event, {} as never, (() => {}) as never) as Promise<APIGatewayProxyStructuredResultV2>;
+      return patientOrdersDetailHandler(event, {} as never, (() => { }) as never) as Promise<APIGatewayProxyStructuredResultV2>;
     }
 
     // GET /health-data

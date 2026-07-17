@@ -77,25 +77,25 @@ function funnelStage(r: PatientRow): FunnelFilter {
 }
 
 const STAGE_CONFIG: Record<string, { color: string; bg: string; border: string; label: string; desc: string }> = {
-  registered_purchased: { color: "#4ade80", bg: "#0d1f0f", border: "#1a3d1f", label: "Registered + purchased",  desc: "Has doc-app account & at least one Saleor order" },
-  registered_only:      { color: "#93c5fd", bg: "#0f1a2e", border: "#1d3a5e", label: "Registered, no purchase", desc: "In doc-app but never placed a shop order" },
-  saleor_only:          { color: "#fbbf24", bg: "#1f1800", border: "#3d2e00", label: "Saleor only",              desc: "Purchased but no doc-app account" },
+  registered_purchased: { color: "#4ade80", bg: "#0d1f0f", border: "#1a3d1f", label: "Registered + purchased", desc: "Has doc-app account & at least one Saleor order" },
+  registered_only: { color: "#93c5fd", bg: "#0f1a2e", border: "#1d3a5e", label: "Registered, no purchase", desc: "In doc-app but never placed a shop order" },
+  saleor_only: { color: "#fbbf24", bg: "#1f1800", border: "#3d2e00", label: "Saleor only", desc: "Purchased but no doc-app account" },
 };
 
 // ── Main ───────────────────────────────────────────────────────────────────────
 export default function PatientRegistryPage() {
-  const [allRows, setAllRows]   = useState<PatientRow[]>([]);
-  const [loading, setLoading]   = useState(true);
-  const [error, setError]       = useState<string | null>(null);
-  const [search, setSearch]     = useState("");
-  const [funnel, setFunnel]     = useState<FunnelFilter>("all");
-  const [sortCol, setSortCol]   = useState("created_at");
-  const [sortDir, setSortDir]   = useState<1 | -1>(-1);
-  const [page, setPage]         = useState(1);
-  const [panel, setPanel]                 = useState<PatientRow | null>(null);
-  const [detail, setDetail]               = useState<PatientDetail | null>(null);
+  const [allRows, setAllRows] = useState<PatientRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [funnel, setFunnel] = useState<FunnelFilter>("all");
+  const [sortCol, setSortCol] = useState("created_at");
+  const [sortDir, setSortDir] = useState<1 | -1>(-1);
+  const [page, setPage] = useState(1);
+  const [panel, setPanel] = useState<PatientRow | null>(null);
+  const [detail, setDetail] = useState<PatientDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
-  const [detailError, setDetailError]     = useState<string | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
 
   function load() {
     setLoading(true); setError(null);
@@ -154,8 +154,8 @@ export default function PatientRegistryPage() {
   }, [allRows, search, funnel, sortCol, sortDir]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const safePage   = Math.min(page, totalPages);
-  const pageRows   = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const safePage = Math.min(page, totalPages);
+  const pageRows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   function sort(col: string) {
     if (sortCol === col) setSortDir((d) => (d === 1 ? -1 : 1));
@@ -170,7 +170,7 @@ export default function PatientRegistryPage() {
     cursor: "pointer", userSelect: "none",
   });
 
-  const docappPct  = allRows.length ? Math.round(counts.registered_purchased / allRows.length * 100) : 0;
+  const docappPct = allRows.length ? Math.round(counts.registered_purchased / allRows.length * 100) : 0;
   const noPurchase = counts.registered_only;
   const noPurchasePct = allRows.length ? Math.round(noPurchase / allRows.length * 100) : 0;
 
@@ -222,9 +222,11 @@ export default function PatientRegistryPage() {
           <div
             key={key}
             onClick={() => { setFunnel(key); setPage(1); }}
-            style={{ background: funnel === key ? "#1a1a1a" : bg, padding: "18px 24px", cursor: "pointer",
+            style={{
+              background: funnel === key ? "#1a1a1a" : bg, padding: "18px 24px", cursor: "pointer",
               borderBottom: funnel === key ? `2px solid ${color}` : "2px solid transparent",
-              transition: "border-color 0.15s" }}
+              transition: "border-color 0.15s"
+            }}
           >
             <div style={{ fontSize: 11, color: "#555", textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</div>
             <div style={{ fontSize: 28, fontWeight: 700, color, letterSpacing: "-0.5px", marginTop: 4 }}>
@@ -275,13 +277,13 @@ export default function PatientRegistryPage() {
             <thead>
               <tr>
                 {([
-                  ["name",           "Name"],
-                  ["email",          "Email"],
-                  ["stage",          "Stage"],
-                  ["has_docapp",     "Doc-app"],
-                  ["has_saleor",     "Saleor"],
-                  ["has_zoho",       "Zoho"],
-                  ["created_at",     "Registered"],
+                  ["name", "Name"],
+                  ["email", "Email"],
+                  ["stage", "Stage"],
+                  ["has_docapp", "Doc-app"],
+                  ["has_saleor", "Saleor"],
+                  ["has_zoho", "Zoho"],
+                  ["created_at", "Registered"],
                 ] as [string, string][]).map(([col, label]) => (
                   <th key={col} style={thStyle(col)} onClick={() => sort(col)}>{label}{arrow(col)}</th>
                 ))}
@@ -302,8 +304,10 @@ export default function PatientRegistryPage() {
                       title={r.email}>{r.email}</td>
                     <td style={{ padding: "9px 12px" }}>
                       {sc ? (
-                        <span style={{ display: "inline-block", padding: "2px 8px", borderRadius: 4, fontSize: 11, fontWeight: 500,
-                          background: sc.bg, color: sc.color, border: `1px solid ${sc.border}` }}>
+                        <span style={{
+                          display: "inline-block", padding: "2px 8px", borderRadius: 4, fontSize: 11, fontWeight: 500,
+                          background: sc.bg, color: sc.color, border: `1px solid ${sc.border}`
+                        }}>
                           {sc.label}
                         </span>
                       ) : (
@@ -523,7 +527,7 @@ function PatientDetailBody({ detail }: { detail: PatientDetail }) {
 
 
 // ── Styles ─────────────────────────────────────────────────────────────────────
-const navLink:     React.CSSProperties = { fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px", whiteSpace: "nowrap" };
-const ghostBtn:    React.CSSProperties = { background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: 6, color: "#aaa", fontSize: 12, padding: "7px 14px", cursor: "pointer" };
+const navLink: React.CSSProperties = { fontSize: 12, color: "#555", textDecoration: "none", border: "1px solid #2a2a2a", borderRadius: 6, padding: "6px 12px", whiteSpace: "nowrap" };
+const ghostBtn: React.CSSProperties = { background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: 6, color: "#aaa", fontSize: 12, padding: "7px 14px", cursor: "pointer" };
 const searchInput: React.CSSProperties = { background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: 6, color: "#e8e8e8", fontSize: 13, padding: "7px 12px", width: 240, outline: "none" };
 const selectStyle: React.CSSProperties = { background: "#1a1a1a", border: "1px solid #2a2a2a", borderRadius: 6, color: "#e8e8e8", fontSize: 13, padding: "7px 10px", outline: "none", cursor: "pointer" };
