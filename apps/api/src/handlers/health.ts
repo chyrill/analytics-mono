@@ -158,7 +158,11 @@ function computeAdherencePct(
   supplyIntervalTotalActive: number | null,
 ): number | null {
   if (repeats == null || supplyIntervalTotalActive == null) return null;
-  const denominator = (repeats - ((repeatsRemainingActive ?? 0) - 1)) * supplyIntervalTotalActive;
+  // doc-app's own repeats_remaining_active is sometimes corrupted (negative,
+  // or larger than repeats + 1) — clamp it into the only sane range so a bad
+  // value can't blow the denominator up (or down) into a misleading ratio.
+  const safeRepeatsRemaining = Math.min(Math.max(repeatsRemainingActive ?? 0, 0), repeats);
+  const denominator = (repeats - (safeRepeatsRemaining - 1)) * supplyIntervalTotalActive;
   if (denominator <= 0) return null;
   return Math.round(Math.min((boughtG ?? 0) / denominator, 1) * 1000) / 10;
 }
