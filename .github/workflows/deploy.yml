@@ -112,6 +112,17 @@ jobs:
           cp -r packages/db/migrations "$BUNDLE_DIR/migrations"
           cd "$BUNDLE_DIR" && zip -r /tmp/analytics-migration.zip .
 
+      - name: Package Backfill Lambda
+        run: |
+          BUNDLE_DIR=/tmp/analytics-backfill-bundle
+          rm -rf "$BUNDLE_DIR" && mkdir -p "$BUNDLE_DIR"
+          npx esbuild packages/db/src/build-history-lambda.ts \
+            --bundle --platform=node --target=node20 \
+            --conditions=require \
+            --outfile="$BUNDLE_DIR/index.js" \
+            --external:pg-native
+          cd "$BUNDLE_DIR" && zip -r /tmp/analytics-backfill.zip .
+
       # ── Deploy Lambda function code ──────────────────────────────────────────
 
       - name: Deploy API Lambda function code
@@ -144,6 +155,16 @@ jobs:
           aws lambda wait function-updated \
             --function-name "harvest-analytics-migration-production" \
             --region ap-southeast-2
+
+      - name: Deploy Backfill Lambda function code
+        run: |
+          aws lambda update-function-code \
+            --function-name "harvest-analytics-backfill-production" \
+            --zip-file "fileb:///tmp/analytics-backfill.zip" \
+            --region ap-southeast-2
+        # Code is kept current on every deploy, but the function is NOT invoked
+        # here — it's a heavy, on-demand recompute. Trigger it manually via
+        # the "Backfill Supply History" workflow (workflow_dispatch) when needed.
 
       # ── Run database migrations ──────────────────────────────────────────────
 

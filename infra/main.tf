@@ -43,6 +43,19 @@ module "migration" {
   depends_on = [module.database]
 }
 
+module "backfill" {
+  source = "./modules/backfill"
+
+  stage                  = var.stage
+  service_name           = var.service_name
+  lambda_runtime         = var.lambda_runtime
+  vpc_subnet_ids         = module.networking.subnet_ids
+  vpc_security_group_ids = [module.networking.lambda_sg_id]
+  database_url           = local.db_url
+
+  depends_on = [module.database]
+}
+
 module "api" {
   source = "./modules/api"
 

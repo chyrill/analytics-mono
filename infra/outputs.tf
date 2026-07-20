@@ -13,6 +13,11 @@ output "migration_function_name" {
   value       = module.migration.function_name
 }
 
+output "backfill_function_name" {
+  description = "Name of the backfill Lambda function — invoke manually to (re)compute supply_tracking_history"
+  value       = module.backfill.function_name
+}
+
 output "web_bucket" {
   description = "S3 bucket name for the web dashboard"
   value       = var.enable_frontend ? module.frontend[0].bucket_name : ""

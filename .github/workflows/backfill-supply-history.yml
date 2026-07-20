@@ -1,0 +1,76 @@
+name: Backfill — Supply Tracking History
+
+# On-demand recompute of supply_tracking_history (analytics DB only — never
+# touches DocApp/production clinical data). Safe to rerun anytime: the
+# Lambda deletes existing rows in scope and rebuilds from scratch.
+#
+# This is intentionally NOT part of the normal deploy workflow — it's a
+# heavier, occasional job, not something that should run on every deploy.
+# Run the "Deploy — Analytics Production" workflow first if you need the
+# Lambda's code updated; this workflow only invokes whatever is currently
+# deployed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "backfill" to confirm running against production'
+        required: true
+        type: string
+      email:
+        description: 'Optional: limit to a single patient email (leave blank for all patients)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Compute and log only, no writes'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  backfill:
+    if: ${{ github.event.inputs.confirm == 'backfill' }}
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      - name: Invoke Backfill Lambda
+        run: |
+          PAYLOAD=$(node -e "
+            const email = process.env.EMAIL;
+            const dryRun = process.env.DRY_RUN === 'true';
+            const payload = {};
+            if (email) payload.email = email;
+            if (dryRun) payload.dryRun = true;
+            process.stdout.write(JSON.stringify(payload));
+          ")
+          echo "Invoking with payload: ${PAYLOAD}"
+
+          INVOKE_RESULT=$(aws lambda invoke \
+            --function-name "harvest-analytics-backfill-production" \
+            --payload "${PAYLOAD}" \
+            --cli-binary-format raw-in-base64-out \
+            --region ap-southeast-2 \
+            /tmp/backfill-result.json)
+
+          echo "Invoke metadata: $INVOKE_RESULT"
+          echo "Backfill response:"
+          cat /tmp/backfill-result.json
+
+          if echo "$INVOKE_RESULT" | grep -q '"FunctionError"'; then
+            echo "ERROR: Backfill Lambda failed"
+            exit 1
+          fi
+        env:
+          EMAIL: ${{ github.event.inputs.email }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}

@@ -5,6 +5,7 @@ import * as funnelEventsSchema from "./schema/funnel-events";
 import * as zohoContactsSchema from "./schema/zoho-contacts";
 import * as reconciliationLogSchema from "./schema/reconciliation-log";
 import * as supplyTrackingSchema from "./schema/supply-tracking";
+import * as supplyTrackingHistorySchema from "./schema/supply-tracking-history";
 import * as cartSessionsSchema from "./schema/cart-sessions";
 import * as ordersDispatchedSchema from "./schema/orders-dispatched";
 import * as saleorOrdersSchema from "./schema/saleor-orders";
@@ -39,6 +40,7 @@ const schema = {
   ...zohoContactsSchema,
   ...reconciliationLogSchema,
   ...supplyTrackingSchema,
+  ...supplyTrackingHistorySchema,
   ...cartSessionsSchema,
   ...ordersDispatchedSchema,
   ...saleorOrdersSchema,
@@ -62,6 +64,7 @@ export * from "./schema/customers";
 export * from "./schema/funnel-events";
 export * from "./schema/zoho-contacts";
 export * from "./schema/supply-tracking";
+export * from "./schema/supply-tracking-history";
 export * from "./schema/cart-sessions";
 export * from "./schema/orders-dispatched";
 export * from "./schema/saleor-orders";
