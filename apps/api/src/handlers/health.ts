@@ -395,7 +395,11 @@ function computeHealthRow(
     signed_up: patient.signed_up,
     script_end_date: patient.script_expiration_date,
     repeat_count: repeatCount,
-    repeats_remaining: patient.repeats_remaining_active != null ? Number(patient.repeats_remaining_active) : null,
+    // doc-app's own counter has no floor at zero (see docapp-db.ts comment
+    // above) and can go negative — clamp what we display, same floor already
+    // applied internally to the adherence % calc via computeAdherencePct().
+    repeats_remaining:
+      patient.repeats_remaining_active != null ? Math.max(0, Number(patient.repeats_remaining_active)) : null,
     allotted_g: patient.alloted_g != null ? Number(patient.alloted_g) : null,
     bought_g: boughtG,
     avg_remaining_g: patient.avg_remaining_g != null ? Number(patient.avg_remaining_g) : null,

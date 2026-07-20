@@ -303,7 +303,10 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
         : null,
       allowance: {
         repeats: allowance?.repeats ?? null,
-        repeats_remaining: allowance?.repeats_remaining_active ?? null,
+        // doc-app's own counter has no floor at zero — clamp what we display,
+        // matching the same floor applied on the /health endpoint.
+        repeats_remaining:
+          allowance?.repeats_remaining_active != null ? Math.max(0, allowance.repeats_remaining_active) : null,
         script_expiration_date: allowance?.script_expiration_date ?? null,
         needs_update: allowance?.needs_update ?? null,
         allotted_g: allottedG,
