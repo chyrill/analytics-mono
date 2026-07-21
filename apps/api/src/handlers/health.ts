@@ -149,6 +149,84 @@ function buildSaleorGramsQuery() {
   `);
 }
 
+/** Independently-computed adherence source (see scripts/build-supply-tracking-history.ts).
+ *  Derived only from db_treatment_plans + saleor_orders/saleor_order_lines — never from
+ *  doc-app's own live tracker (treatmentplantracker / db_treatment_plan_tracker), which has
+ *  a verified no-floor-at-zero / no-row-locking bug. This is now the primary source for
+ *  repeats/allotment/adherence on /health; the doc-app tracker fields on `patient` are kept
+ *  only as a fallback for patients with no rows here yet. */
+interface SupplyHistoryRow {
+  email: string;
+  strength: number | null;
+  repeats: number | null;
+  repeats_remaining_active: number | null;
+  supply_interval_total_active: number | null;
+  needs_update: boolean | null;
+  script_expiration_date: string | null;
+  alloted_g: number | null;
+  bought_g: number | null;
+  adherence_pct: number | null;
+}
+
+function buildSupplyHistoryQuery() {
+  return sql.raw(`
+    WITH latest AS (
+      SELECT DISTINCT ON (email)
+        email, chain_id, source_id, strength, repeats_remaining, grams_target, flagged
+      FROM supply_tracking_history
+      ORDER BY email, window_start DESC
+    ),
+    plan_agg AS (
+      -- Scoped to the rows governed by the SAME source_id (treatment-plan
+      -- record) as the latest window, i.e. the last ACTIVE treatment plan —
+      -- not the whole chain, which may span several superseded plans
+      -- (quantity changes, strength switches, extensions) before it.
+      SELECT
+        sth.email,
+        -- repeats_remaining decreases by 1 per fill_index under a given
+        -- source_id; its max is the remaining count as of the moment this
+        -- plan took over, i.e. the plan's own repeat entitlement.
+        MAX(sth.repeats_remaining)                                                              AS repeats,
+        MAX(sth.window_end)                                                                      AS script_expiration_date,
+        -- Adherence is now scoped to the calendar year-to-date (Jan 1 -> today), not the
+        -- chain's full elapsed history, so it reflects recent behavior rather than being
+        -- diluted/inflated by windows from prior years.
+        SUM(sth.grams_target) FILTER (
+          WHERE sth.window_start >= date_trunc('year', CURRENT_DATE) AND sth.window_start <= CURRENT_DATE
+        )                                                                                         AS allotted_g_elapsed,
+        SUM(sth.grams_actual) FILTER (
+          WHERE sth.window_start >= date_trunc('year', CURRENT_DATE) AND sth.window_start <= CURRENT_DATE
+        )                                                                                         AS bought_g
+      FROM supply_tracking_history sth
+      JOIN latest l ON l.chain_id = sth.chain_id AND l.source_id = sth.source_id
+      GROUP BY sth.email
+    )
+    SELECT
+      l.email,
+      l.strength::int                                                            AS strength,
+      pa.repeats,
+      l.repeats_remaining                                                        AS repeats_remaining_active,
+      l.grams_target                                                             AS supply_interval_total_active,
+      l.flagged                                                                  AS needs_update,
+      pa.script_expiration_date,
+      -- Total fills under this plan = the initial dispense + repeats refills
+      -- (windows are generated for fill_index 0..repeats inclusive, i.e.
+      -- repeats+1 windows -- see generateWindows()/startChain() in
+      -- build-supply-tracking-history.ts). Using repeats alone here would
+      -- under-count by exactly one window's grams, which can make a
+      -- still-adherent patient look like they've "used up" their full
+      -- allotment when they haven't.
+      ROUND((l.grams_target * (pa.repeats + 1))::numeric, 1)                     AS alloted_g,
+      ROUND(COALESCE(pa.bought_g, 0)::numeric, 1)                                AS bought_g,
+      CASE
+        WHEN COALESCE(pa.allotted_g_elapsed, 0) <= 0 THEN NULL
+        ELSE ROUND(LEAST(COALESCE(pa.bought_g, 0) / pa.allotted_g_elapsed, 1) * 100, 1)
+      END                                                                        AS adherence_pct
+    FROM latest l
+    JOIN plan_agg pa ON pa.email = l.email
+  `);
+}
+
 /** Mirrors docapp-db.ts's ADHERENCE_PCT_SQL, applied in application code when
  *  `bought_g` has been swapped for the Saleor-sourced figure below. */
 function computeAdherencePct(
@@ -294,27 +372,45 @@ function computeHealthRow(
   shop: ShopEngagementRow | undefined,
   lastOrder: LastOrderRow | undefined,
   saleorGrams: SaleorGramsRow | undefined,
+  supplyHistory: SupplyHistoryRow | undefined,
 ): ComputedHealthRow {
-  // doc-app's tracker can under-report grams bought (usage not recorded
-  // there) even though the patient has real Saleor purchase history —
-  // whenever Saleor's total exceeds the tracker's, trust Saleor instead and
-  // recompute adherence_pct off of it (doc-app's precomputed adherence_pct
-  // would otherwise still be based on the smaller tracker figure).
-  const docAppBoughtG = patient.bought_g != null ? Number(patient.bought_g) : null;
-  const saleorBoughtG = saleorGrams?.total_grams != null ? Number(saleorGrams.total_grams) : null;
-  const useSaleorBoughtG = saleorBoughtG != null && saleorBoughtG > (docAppBoughtG ?? 0);
-  const boughtG = useSaleorBoughtG ? saleorBoughtG : docAppBoughtG;
+  // supply_tracking_history (independently computed from db_treatment_plans +
+  // saleor_order_lines — see scripts/build-supply-tracking-history.ts) is now
+  // the primary source for repeats/allotment/adherence. It doesn't inherit
+  // doc-app's live tracker bug (no floor at zero, no row locking around the
+  // decrement). Fall back to doc-app's own tracker fields on `patient` only
+  // for patients with no supply_tracking_history rows yet.
+  const repeats = supplyHistory?.repeats ?? (patient.repeats != null ? Number(patient.repeats) : null);
+  const repeatsRemainingActive =
+    supplyHistory?.repeats_remaining_active ??
+    (patient.repeats_remaining_active != null ? Number(patient.repeats_remaining_active) : null);
+  const supplyIntervalTotalActive =
+    supplyHistory?.supply_interval_total_active ??
+    (patient.supply_interval_total_active != null ? Number(patient.supply_interval_total_active) : null);
+  const allottedG = supplyHistory?.alloted_g ?? (patient.alloted_g != null ? Number(patient.alloted_g) : null);
+  const scriptExpirationDate = supplyHistory?.script_expiration_date ?? patient.script_expiration_date;
+  const needsUpdate = supplyHistory ? Boolean(supplyHistory.needs_update) : Boolean(patient.needs_update);
 
-  const adherencePct = useSaleorBoughtG
-    ? computeAdherencePct(
-        boughtG,
-        patient.repeats != null ? Number(patient.repeats) : null,
-        patient.repeats_remaining_active != null ? Number(patient.repeats_remaining_active) : null,
-        patient.supply_interval_total_active != null ? Number(patient.supply_interval_total_active) : null,
-      )
-    : patient.adherence_pct != null ? Number(patient.adherence_pct) : null;
-  const hasPlan = patient.repeats != null || patient.supply_total_active != null;
-  const repeatCount = patient.repeats != null ? Number(patient.repeats) : null;
+  let boughtG: number | null;
+  let adherencePct: number | null;
+  if (supplyHistory) {
+    boughtG = supplyHistory.bought_g != null ? Number(supplyHistory.bought_g) : null;
+    adherencePct = supplyHistory.adherence_pct != null ? Number(supplyHistory.adherence_pct) : null;
+  } else {
+    // Legacy fallback (doc-app tracker) — only reached for patients with no
+    // supply_tracking_history rows yet. Mirrors the old Saleor-override hack
+    // that compensated for the tracker's under-reported usage.
+    const docAppBoughtG = patient.bought_g != null ? Number(patient.bought_g) : null;
+    const saleorBoughtG = saleorGrams?.total_grams != null ? Number(saleorGrams.total_grams) : null;
+    const useSaleorBoughtG = saleorBoughtG != null && saleorBoughtG > (docAppBoughtG ?? 0);
+    boughtG = useSaleorBoughtG ? saleorBoughtG : docAppBoughtG;
+    adherencePct = useSaleorBoughtG
+      ? computeAdherencePct(boughtG, repeats, repeatsRemainingActive, supplyIntervalTotalActive)
+      : patient.adherence_pct != null ? Number(patient.adherence_pct) : null;
+  }
+
+  const hasPlan = repeats != null || allottedG != null;
+  const repeatCount = repeats;
   const purchaseRatePct = shop?.purchase_rate_pct != null ? Number(shop.purchase_rate_pct) : null;
   const avgVisitsPerMonth = patient.avg_visits_per_month != null ? Number(patient.avg_visits_per_month) : null;
 
@@ -324,7 +420,7 @@ function computeHealthRow(
 
   const lastActivityDate = lastOrder?.last_order_date ?? lastVisit;
   const daysSinceActivity = daysSince(lastActivityDate);
-  const daysOverdue = daysSince(patient.script_expiration_date); // positive = past expiration
+  const daysOverdue = daysSince(scriptExpirationDate); // positive = past expiration
 
   const isRedLowGrams = adherencePct != null && adherencePct < 25;
   const isRedNoPurchase90 = daysSinceActivity == null || daysSinceActivity > 90;
@@ -332,13 +428,12 @@ function computeHealthRow(
 
   const isOrangeGrams2550 = adherencePct != null && adherencePct >= 25 && adherencePct <= 50;
   const isOrangeNoPurchase4690 = daysSinceActivity != null && daysSinceActivity > 45 && daysSinceActivity <= 90;
-  const isOrangeConsultationDue =
-    Boolean(patient.needs_update) || (daysOverdue != null && daysOverdue >= 0 && daysOverdue <= 60);
+  const isOrangeConsultationDue = needsUpdate || (daysOverdue != null && daysOverdue >= 0 && daysOverdue <= 60);
 
   const isPurpleGrams75110 = adherencePct != null && adherencePct >= 75 && adherencePct <= 110;
   const isPurpleRecentPurchase30 = daysSinceActivity != null && daysSinceActivity <= 30;
   const isPurpleRepeatCount3 = (repeatCount ?? 0) >= 3;
-  const consultationCurrent = !patient.needs_update && (daysOverdue == null || daysOverdue < 0);
+  const consultationCurrent = !needsUpdate && (daysOverdue == null || daysOverdue < 0);
 
   const isGreenGrams5075 = adherencePct != null && adherencePct >= 50 && adherencePct <= 75;
   const isGreenRecentPurchase45 = daysSinceActivity != null && daysSinceActivity <= 45;
@@ -393,14 +488,12 @@ function computeHealthRow(
     patient_name: patient.patient_name,
     email: patient.email,
     signed_up: patient.signed_up,
-    script_end_date: patient.script_expiration_date,
+    script_end_date: scriptExpirationDate,
     repeat_count: repeatCount,
-    // doc-app's own counter has no floor at zero (see docapp-db.ts comment
-    // above) and can go negative — clamp what we display, same floor already
-    // applied internally to the adherence % calc via computeAdherencePct().
-    repeats_remaining:
-      patient.repeats_remaining_active != null ? Math.max(0, Number(patient.repeats_remaining_active)) : null,
-    allotted_g: patient.alloted_g != null ? Number(patient.alloted_g) : null,
+    // Clamp what we display — supply_tracking_history already floors this at
+    // zero itself, but the legacy doc-app tracker fallback path doesn't.
+    repeats_remaining: repeatsRemainingActive != null ? Math.max(0, repeatsRemainingActive) : null,
+    allotted_g: allottedG,
     bought_g: boughtG,
     avg_remaining_g: patient.avg_remaining_g != null ? Number(patient.avg_remaining_g) : null,
     adherence_pct: adherencePct,
@@ -449,14 +542,16 @@ async function loadHealthRows(
     patientRows = toRows<LivePatientHealthRow>(await db.execute(buildMirrorPatientHealthQuery()));
   }
 
-  const [shopResult, lastOrderResult, saleorGramsResult] = await Promise.all([
+  const [shopResult, lastOrderResult, saleorGramsResult, supplyHistoryResult] = await Promise.all([
     db.execute(buildShopEngagementQuery(from, to)),
     db.execute(buildLastOrderQuery()),
     db.execute(buildSaleorGramsQuery()),
+    db.execute(buildSupplyHistoryQuery()),
   ]);
   const shopByEmail = new Map(toRows<ShopEngagementRow>(shopResult).map((r) => [r.email, r]));
   const lastOrderByEmail = new Map(toRows<LastOrderRow>(lastOrderResult).map((r) => [r.email, r]));
   const saleorGramsByEmail = new Map(toRows<SaleorGramsRow>(saleorGramsResult).map((r) => [r.email, r]));
+  const supplyHistoryByEmail = new Map(toRows<SupplyHistoryRow>(supplyHistoryResult).map((r) => [r.email, r]));
 
   const rows = patientRows.map((patient) =>
     computeHealthRow(
@@ -464,6 +559,7 @@ async function loadHealthRows(
       shopByEmail.get(patient.email),
       lastOrderByEmail.get(patient.email),
       saleorGramsByEmail.get(patient.email),
+      supplyHistoryByEmail.get(patient.email),
     ),
   );
 
