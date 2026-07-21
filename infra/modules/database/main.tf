@@ -19,6 +19,17 @@ resource "aws_security_group" "rds" {
     security_groups = var.lambda_security_group_ids
   }
 
+  # Admin access for DBeaver/psql via SSM port-forwarding through the existing
+  # "worker-instance" EC2 (sg-0cfddf7d948d266d8), which is already registered
+  # with SSM Session Manager. No inbound SSH/internet exposure required.
+  ingress {
+    description     = "PostgreSQL from worker-instance (SSM tunnel for admin DB access)"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = ["sg-0cfddf7d948d266d8"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
