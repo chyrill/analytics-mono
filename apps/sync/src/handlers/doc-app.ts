@@ -281,6 +281,22 @@ export const handler: ScheduledHandler = async (_event) => {
     console.warn(`[docapp-sync] orders_dispatched sync failed (skipping): ${(e as Error).message}`);
   }
 
+  // ── 5. Treatment plans + tracker (feeds supply_tracking_history) ────────────
+  try {
+    const conn = await openDocAppConn();
+    try {
+      const t = await syncDocTreatmentPlans(conn, null);
+      console.log(`[docapp-sync] db_treatment_plans upserted: ${t.upserted}`);
+
+      const tr = await syncDocTreatmentPlanTracker(conn, null);
+      console.log(`[docapp-sync] db_treatment_plan_tracker upserted: ${tr.upserted}`);
+    } finally {
+      await conn.end();
+    }
+  } catch (e) {
+    console.warn(`[docapp-sync] treatment_plans sync failed (skipping): ${(e as Error).message}`);
+  }
+
   await db.insert(reconciliationLog).values({
     source: "docapp",
     runAt: runStart,
@@ -528,7 +544,7 @@ async function syncDocPatients(
 
 async function syncDocTreatmentPlans(
   conn: Sql,
-  jobId: string,
+  jobId: string | null,
 ): Promise<{ fetched: number; upserted: number }> {
   const since = await getCheckpoint("docapp", "treatment_plans");
   const syncedAt = new Date();
@@ -746,7 +762,7 @@ interface TreatmentPlanTrackerRow {
 
 async function syncDocTreatmentPlanTracker(
   conn: Sql,
-  jobId: string,
+  jobId: string | null,
 ): Promise<{ fetched: number; upserted: number }> {
   const syncedAt = new Date();
 
