@@ -30,7 +30,14 @@ import postgres from "postgres";
  */
 
 const BATCH_SIZE = 500;
-const STRENGTHS = ["22", "26", "29"] as const;
+// Order reflects the shop's actual strength-catalog rollout over time, NOT
+// numeric order: patients started on 22, were moved to 29, then later moved
+// to 26 once 29 was discontinued in favor of it. pickDominantStrength()
+// tie-breaks toward whichever candidate comes LAST in this array, so this
+// order must track "which strength is newer" at each point in the timeline
+// for a same-quantity tie (e.g. a plan row showing both old and new
+// strength populated during a mid-plan switch) to resolve correctly.
+const STRENGTHS = ["22", "29", "26"] as const;
 type Strength = (typeof STRENGTHS)[number];
 
 interface PlanRow {
@@ -289,10 +296,11 @@ export const handler = async (
         const row = patientPlans[pi];
 
         if (!isApproved(row.outcome)) {
-          if (chain) {
-            allRows.push(...generateWindows(chain, row.plan_date, orderDaysByStrength).map((r) => ({ ...r, email })));
-            chain = null;
-          }
+          // A rejected/withdrawn row means THIS consult request didn't result
+          // in a new plan -- it does NOT revoke whatever plan is already
+          // active. The existing chain (if any) simply continues unaffected;
+          // we don't even use this row's date as a window boundary, since
+          // nothing about the actual approved prescription changed here.
           continue;
         }
 
@@ -308,16 +316,28 @@ export const handler = async (
 
         const kind = classify(row.diagnosis);
         if (kind === "EXTENSION") {
+          // "Extend" means more refills on TOP of the current entitlement --
+          // additive, not a reset.
           chain.effectiveRepeats += row.r[chain.activeStrength] || row.r[dominant];
           chain.governingSourceId = row.source_id;
         } else if (kind === "QUANTITY_CHANGE") {
           chain.gramsPerInterval = row.q[chain.activeStrength] || row.q[dominant];
           chain.intervalDays = row.i[chain.activeStrength] || row.i[dominant] || chain.intervalDays;
+          // A quantity-change row is a fresh clinical re-authorization, not a
+          // top-up: the patient gets a FRESH repeat count from this point
+          // forward, regardless of how many fills the old entitlement had
+          // left (or had already overrun). fillIndex is the count of windows
+          // already generated, so fillIndex + newRepeats is the effectiveRepeats
+          // value that makes "repeats remaining right now" equal newRepeats.
+          chain.effectiveRepeats = chain.fillIndex + (row.r[chain.activeStrength] || row.r[dominant]);
           chain.governingSourceId = row.source_id;
         } else if (kind === "SWITCH") {
           chain.activeStrength = dominant;
           chain.gramsPerInterval = row.q[dominant];
           chain.intervalDays = row.i[dominant];
+          // Same fresh-entitlement rule as QUANTITY_CHANGE -- a strength switch
+          // is a new plan, not a continuation of the old strength's leftover count.
+          chain.effectiveRepeats = chain.fillIndex + row.r[dominant];
           chain.governingSourceId = row.source_id;
         } else {
           const unchanged =
