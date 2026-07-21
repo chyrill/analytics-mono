@@ -57,7 +57,7 @@
 import postgres from "postgres";
 
 const DB_URL =
-    process.env.DATABASE_URL ?? "postgresql://analytics:analytics@localhost:5433/analytics";
+    process.env.DATABASE_URL ?? "postgresql://analytics:analytics@localhost:15432/analytics";
 
 const DRY_RUN = process.argv.includes("--dry-run");
 const TARGET_EMAIL = (() => {
@@ -174,8 +174,17 @@ function startChain(row: PlanRow, strength: Strength, flagged = false, flagReaso
 /**
  * Generates windows for the current chain up to (but not including) `untilDate`,
  * applying `today` as the hard stop. Returns generated rows; mutates `chain`.
+ *
+ * `orderDays` maps order date -> total grams purchased that day, summed
+ * across ALL strengths. We deliberately do NOT filter by the chain's
+ * currently-active strength here: patients often place an order for a new
+ * strength a few days before (or after) the plan system's recorded switch
+ * date, which would otherwise silently drop that purchase from every
+ * window (wrong strength for the old window, wrong date range for the new
+ * one). For adherence purposes what matters is grams bought in the date
+ * range, not which exact SKU/strength code the order line carried.
  */
-function generateWindows(chain: ChainState, untilDate: string, orderDaysByStrength: Map<Strength, Map<string, number>>): HistoryRow[] {
+function generateWindows(chain: ChainState, untilDate: string, orderDays: Map<string, number>): HistoryRow[] {
     const out: HistoryRow[] = [];
     const hardStop = cmpDate(untilDate, "9999-12-31") === 0 ? untilDate : untilDate;
 
@@ -186,11 +195,10 @@ function generateWindows(chain: ChainState, untilDate: string, orderDaysByStreng
         const windowEnd = addDays(windowStart, chain.intervalDays);
         const exhausted = chain.fillIndex > chain.effectiveRepeats;
 
-        const dayMap = orderDaysByStrength.get(chain.activeStrength) ?? new Map<string, number>();
         let gramsActual = 0;
         let cur = windowStart;
         while (cmpDate(cur, windowEnd) < 0) {
-            gramsActual += dayMap.get(cur) ?? 0;
+            gramsActual += orderDays.get(cur) ?? 0;
             cur = addDays(cur, 1);
         }
 
@@ -278,35 +286,33 @@ async function main() {
     }));
     console.log(`[build-history] loaded ${plans.length} treatment plan rows`);
 
-    // ── 2. Load saleor order-line grams, per email/day/strength ──────────────
-    // saleor_order_lines.thc_level carries the actual purchased strength
-    // ('thc-22'/'thc-26'/'thc-29'); lines without it (accessories etc.) are
-    // excluded since they don't count toward flower supply.
-    const orderRows = await sql<{ email: string; order_date: string; strength: string; grams: number }[]>`
+    // ── 2. Load saleor order-line grams, per email/day (strength-agnostic) ───
+    // saleor_order_lines.thc_level is only used here as a flower-vs-non-flower
+    // filter ('thc-22'/'thc-26'/'thc-29'); lines without it (accessories,
+    // fees, etc.) are excluded since they don't count toward flower supply.
+    // We intentionally do NOT keep strength as a matching key beyond this —
+    // see generateWindows() for why.
+    const orderRows = await sql<{ email: string; order_date: string; grams: number }[]>`
     SELECT
       so.email,
       (so.ordered_at AT TIME ZONE 'Australia/Sydney')::date::text AS order_date,
-      right(sol.thc_level, 2)                                     AS strength,
       SUM(sol.grams::numeric)                                     AS grams
     FROM saleor_order_lines sol
     JOIN saleor_orders so ON so.source_id = sol.order_id
     WHERE so.email IS NOT NULL
       AND sol.thc_level IN ('thc-22', 'thc-26', 'thc-29')
       ${TARGET_EMAIL ? sql`AND so.email = ${TARGET_EMAIL}` : sql``}
-    GROUP BY so.email, (so.ordered_at AT TIME ZONE 'Australia/Sydney')::date, sol.thc_level
+    GROUP BY so.email, (so.ordered_at AT TIME ZONE 'Australia/Sydney')::date
     ORDER BY so.email, order_date
   `;
 
-    const ordersByEmail = new Map<string, Map<Strength, Map<string, number>>>();
+    const ordersByEmail = new Map<string, Map<string, number>>();
     for (const row of orderRows) {
-        let byStrength = ordersByEmail.get(row.email);
-        if (!byStrength) { byStrength = new Map(); ordersByEmail.set(row.email, byStrength); }
-        const strength = row.strength as Strength;
-        let dayMap = byStrength.get(strength);
-        if (!dayMap) { dayMap = new Map(); byStrength.set(strength, dayMap); }
+        let dayMap = ordersByEmail.get(row.email);
+        if (!dayMap) { dayMap = new Map(); ordersByEmail.set(row.email, dayMap); }
         dayMap.set(row.order_date, Number(row.grams));
     }
-    console.log(`[build-history] loaded per-strength order-day grams for ${ordersByEmail.size} emails`);
+    console.log(`[build-history] loaded order-day grams for ${ordersByEmail.size} emails`);
 
     // ── 3. Group plans by email ───────────────────────────────────────────────
     const plansByEmail = new Map<string, PlanRow[]>();
@@ -322,7 +328,7 @@ async function main() {
     let unrecognizedResets = 0;
 
     for (const [email, patientPlans] of plansByEmail) {
-        const orderDaysByStrength = ordersByEmail.get(email) ?? new Map<Strength, Map<string, number>>();
+        const orderDays = ordersByEmail.get(email) ?? new Map<string, number>();
 
         let chain: ChainState | null = null;
 
@@ -347,7 +353,7 @@ async function main() {
             }
 
             // Generate windows under the OLD chain up to this row's date, THEN apply the row's effect.
-            allRows.push(...generateWindows(chain, row.plan_date, orderDaysByStrength).map((r) => ({ ...r, email })));
+            allRows.push(...generateWindows(chain, row.plan_date, orderDays).map((r) => ({ ...r, email })));
 
             const kind = classify(row.diagnosis);
             if (kind === "EXTENSION") {
@@ -394,7 +400,7 @@ async function main() {
         }
 
         if (chain) {
-            allRows.push(...generateWindows(chain, today, orderDaysByStrength).map((r) => ({ ...r, email })));
+            allRows.push(...generateWindows(chain, today, orderDays).map((r) => ({ ...r, email })));
             if (chain.flagged) flaggedChains += 1;
         }
     }

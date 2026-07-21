@@ -182,7 +182,7 @@ function buildSupplyHistoryQuery() {
       -- not the whole chain, which may span several superseded plans
       -- (quantity changes, strength switches, extensions) before it. This is
       -- only for the plan's own entitlement figures (repeats, expiration) —
-      -- NOT for adherence, which needs the elapsed-window fallback below.
+      -- NOT for adherence, which is computed chain-wide below (see adherence CTE).
       SELECT
         sth.email,
         -- repeats_remaining decreases by 1 per fill_index under a given
@@ -194,27 +194,18 @@ function buildSupplyHistoryQuery() {
       JOIN latest l ON l.chain_id = sth.chain_id AND l.source_id = sth.source_id
       GROUP BY sth.email
     ),
-    adherence_by_plan AS (
-      -- Adherence scoped to the CURRENT plan segment (year-to-date), counting
-      -- ONLY windows that have FULLY elapsed (window_end <= today). An
-      -- in-progress window hasn't had its full interval to be bought yet, so
-      -- counting its full target against a patient who just started it would
-      -- unfairly zero out their adherence the moment a plan is revised.
-      SELECT
-        sth.email,
-        SUM(sth.grams_target)                                                                    AS allotted_g_elapsed,
-        SUM(sth.grams_actual)                                                                     AS bought_g
-      FROM supply_tracking_history sth
-      JOIN latest l ON l.chain_id = sth.chain_id AND l.source_id = sth.source_id
-      WHERE sth.window_start >= date_trunc('year', CURRENT_DATE) AND sth.window_end <= CURRENT_DATE
-      GROUP BY sth.email
-    ),
-    adherence_by_chain AS (
-      -- Fallback for when the current plan segment has NO fully-elapsed
-      -- windows yet (it just started, e.g. after a dose change/switch/
-      -- extension) — widen to the whole chain's elapsed history (still
-      -- year-to-date) instead of showing a freshly-revised, previously
-      -- adherent patient as 0%.
+    adherence AS (
+      -- Adherence scoped to the WHOLE chain (year-to-date), counting ONLY
+      -- windows that have FULLY elapsed (window_end <= today). We
+      -- deliberately do NOT scope this to just the current plan segment's
+      -- source_id: a plan revision (quantity change/switch/extension) can
+      -- land mid-chain and still have plenty of the patient's real purchase
+      -- history sitting under earlier segments of the same chain. Scoping
+      -- to "current segment only" either zeroes out a freshly-revised but
+      -- previously-adherent patient (nothing elapsed yet), or silently
+      -- under-counts a patient whose current segment has SOME but not all
+      -- of their purchase history (e.g. most of it happened under an
+      -- earlier segment). Chain-wide, year-to-date is the accurate picture.
       SELECT
         sth.email,
         SUM(sth.grams_target)                                                                    AS allotted_g_elapsed,
@@ -240,15 +231,14 @@ function buildSupplyHistoryQuery() {
       -- still-adherent patient look like they've "used up" their full
       -- allotment when they haven't.
       ROUND((l.grams_target * (pa.repeats + 1))::numeric, 1)                     AS alloted_g,
-      ROUND(COALESCE(ap.bought_g, ac.bought_g, 0)::numeric, 1)                   AS bought_g,
+      ROUND(COALESCE(a.bought_g, 0)::numeric, 1)                                 AS bought_g,
       CASE
-        WHEN COALESCE(ap.allotted_g_elapsed, ac.allotted_g_elapsed, 0) <= 0 THEN NULL
-        ELSE ROUND(LEAST(COALESCE(ap.bought_g, ac.bought_g, 0) / COALESCE(ap.allotted_g_elapsed, ac.allotted_g_elapsed), 1) * 100, 1)
+        WHEN COALESCE(a.allotted_g_elapsed, 0) <= 0 THEN NULL
+        ELSE ROUND(LEAST(COALESCE(a.bought_g, 0) / a.allotted_g_elapsed, 1) * 100, 1)
       END                                                                        AS adherence_pct
     FROM latest l
     JOIN plan_agg pa ON pa.email = l.email
-    LEFT JOIN adherence_by_plan ap ON ap.email = l.email
-    LEFT JOIN adherence_by_chain ac ON ac.email = l.email
+    LEFT JOIN adherence a ON a.email = l.email
   `);
 }
 
