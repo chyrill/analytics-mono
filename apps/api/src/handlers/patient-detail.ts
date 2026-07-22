@@ -136,6 +136,29 @@ function buildSupplyHistoryQuery(safeEmail: string) {
   `);
 }
 
+/**
+ * The patient's plan end date ("script expiration date") — MAX(window_end)
+ * scoped to the CURRENT plan segment (same chain_id + source_id as the most
+ * recent window), matching the exact computation health.ts uses for the
+ * script_end_date column shown in the main table. Keeping this identical
+ * across both endpoints avoids the drilldown panel showing a different end
+ * date than the table row that opened it.
+ */
+function buildPlanEndDateQuery(safeEmail: string) {
+  return sql.raw(`
+    WITH latest AS (
+      SELECT DISTINCT ON (email) email, chain_id, source_id
+      FROM supply_tracking_history
+      WHERE email = '${safeEmail}'
+      ORDER BY email, window_start DESC
+    )
+    SELECT MAX(sth.window_end) AS script_expiration_date
+    FROM supply_tracking_history sth
+    JOIN latest l ON l.chain_id = sth.chain_id AND l.source_id = sth.source_id
+    WHERE sth.email = '${safeEmail}'
+  `);
+}
+
 /** Groups the flat order/line join into one entry per order, with its line items nested. */
 function groupOrders(rows: OrderLineRow[]) {
   const byOrder = new Map<string, {
@@ -313,10 +336,11 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
       allowance = mirrorRows[0] ?? null;
     }
 
-    const [orderLineRows, currentPlanRows, supplyHistoryRows] = await Promise.all([
+    const [orderLineRows, currentPlanRows, supplyHistoryRows, planEndDateRows] = await Promise.all([
       db.execute(buildOrderLinesQuery(safeEmail)),
       db.execute(buildCurrentPlanQuery(safeEmail)),
       db.execute(buildSupplyHistoryQuery(safeEmail)),
+      db.execute(buildPlanEndDateQuery(safeEmail)),
     ]);
 
     const orders = groupOrders(toRows<OrderLineRow>(orderLineRows));
@@ -324,17 +348,13 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
     const currentPlan = toRows<CurrentPlanRow>(currentPlanRows)[0] ?? null;
     const activePlanStrength = currentPlan ? selectActivePlanStrength(currentPlan) : null;
 
-    // Plan end date isn't a stored column on db_treatment_plans — derive it
-    // from the active strength's supply_interval × number_of_repeat, days
-    // after the plan's start date. Null if either input is missing.
+    // Plan end date — same source as the main table's script_end_date
+    // column (MAX window_end for the current plan segment), falling back to
+    // the live/mirror allowance's script_expiration_date if the patient has
+    // no supply_tracking_history rows yet.
     const planStartDate = currentPlan?.date ?? null;
-    const planEndDate =
-      planStartDate != null && activePlanStrength?.supply_interval != null && activePlanStrength?.number_of_repeat != null
-        ? new Date(
-          new Date(planStartDate).getTime() +
-            Number(activePlanStrength.supply_interval) * Number(activePlanStrength.number_of_repeat) * MS_PER_DAY,
-        ).toISOString()
-        : null;
+    const planEndDateFromHistory = toRows<{ script_expiration_date: string | null }>(planEndDateRows)[0]?.script_expiration_date ?? null;
+    const planEndDate = planEndDateFromHistory ?? allowance?.script_expiration_date ?? null;
 
     const supplyHistory = toRows<SupplyHistoryRow>(supplyHistoryRows).map((r) => ({
       window_start: r.window_start,
