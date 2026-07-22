@@ -166,6 +166,7 @@ interface SupplyHistoryRow {
   alloted_g: number | null;
   bought_g: number | null;
   adherence_pct: number | null;
+  completed_cycles: number | null;
 }
 
 function buildSupplyHistoryQuery() {
@@ -235,6 +236,19 @@ function buildSupplyHistoryQuery() {
       FROM supply_tracking_history sth
       WHERE sth.window_end >= date_trunc('year', CURRENT_DATE) AND sth.window_start <= CURRENT_DATE
       GROUP BY sth.email
+    ),
+    cycles AS (
+      -- Completed repeat cycles, whole-patient, ALL-TIME (not YTD -- an
+      -- established multi-year patient shouldn't reset to 0 every January).
+      -- Also joined on email, not chain_id/source_id, for the same reason as
+      -- the adherence CTE above: chain_id resets on every UNRECOGNIZED_PLAN_
+      -- CHANGE, which would otherwise make a long-time patient look brand
+      -- new right after a reset even though they've filled many cycles.
+      SELECT
+        sth.email,
+        COUNT(*) FILTER (WHERE sth.window_end <= CURRENT_DATE)                                  AS completed_cycles
+      FROM supply_tracking_history sth
+      GROUP BY sth.email
     )
     SELECT
       l.email,
@@ -244,6 +258,7 @@ function buildSupplyHistoryQuery() {
       l.grams_target                                                             AS supply_interval_total_active,
       l.flagged                                                                  AS needs_update,
       pa.script_expiration_date,
+      COALESCE(c.completed_cycles, 0)                                            AS completed_cycles,
       -- Must be the SAME scope as bought_g (whole-email YTD elapsed sum,
       -- from the adherence CTE) -- NOT the current plan segment's full
       -- entitlement (grams_target * (repeats+1)). A fresh plan segment
@@ -260,6 +275,7 @@ function buildSupplyHistoryQuery() {
     FROM latest l
     JOIN plan_agg pa ON pa.email = l.email
     LEFT JOIN adherence a ON a.email = l.email
+    LEFT JOIN cycles c ON c.email = l.email
   `);
 }
 
@@ -453,7 +469,21 @@ function computeHealthRow(
   // though the patient hasn't gone through a single cycle yet -- using
   // repeatCount for the "3+ repeat cycles" purple criterion would wrongly
   // flag a brand-new patient as an established repeat customer.
-  const completedRepeats = repeats != null && repeatsRemainingActive != null ? repeats - repeatsRemainingActive : null;
+  //
+  // Use the whole-email, all-time completed_cycles count from
+  // supply_tracking_history (see the `cycles` CTE in buildSupplyHistoryQuery)
+  // rather than (current plan segment's repeats - repeats_remaining_active):
+  // that segment-scoped subtraction resets to ~0 on every
+  // UNRECOGNIZED_PLAN_CHAIN reset, which would wrongly make a long-time,
+  // many-cycles patient look brand new right after a reset (e.g. Graeme,
+  // Federico -- both had several completed cycles under an earlier chain
+  // before the most recent reset).
+  const completedRepeats =
+    supplyHistory?.completed_cycles != null
+      ? Number(supplyHistory.completed_cycles)
+      : repeats != null && repeatsRemainingActive != null
+        ? repeats - repeatsRemainingActive
+        : null;
   const purchaseRatePct = shop?.purchase_rate_pct != null ? Number(shop.purchase_rate_pct) : null;
   const avgVisitsPerMonth = patient.avg_visits_per_month != null ? Number(patient.avg_visits_per_month) : null;
 
