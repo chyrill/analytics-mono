@@ -244,14 +244,14 @@ function buildSupplyHistoryQuery() {
       l.grams_target                                                             AS supply_interval_total_active,
       l.flagged                                                                  AS needs_update,
       pa.script_expiration_date,
-      -- Total fills under this plan = the initial dispense + repeats refills
-      -- (windows are generated for fill_index 0..repeats inclusive, i.e.
-      -- repeats+1 windows -- see generateWindows()/startChain() in
-      -- build-supply-tracking-history.ts). Using repeats alone here would
-      -- under-count by exactly one window's grams, which can make a
-      -- still-adherent patient look like they've "used up" their full
-      -- allotment when they haven't.
-      ROUND((l.grams_target * (pa.repeats + 1))::numeric, 1)                     AS alloted_g,
+      -- Must be the SAME scope as bought_g (whole-email YTD elapsed sum,
+      -- from the adherence CTE) -- NOT the current plan segment's full
+      -- entitlement (grams_target * (repeats+1)). A fresh plan segment
+      -- with barely any elapsed windows would otherwise show its full
+      -- multi-repeat entitlement as "allotted" next to a YTD-scoped
+      -- "bought", making the two figures incomparable (e.g. a brand new
+      -- 6-repeat plan showing 196g allotted after only 28g has elapsed).
+      ROUND(COALESCE(a.allotted_g_elapsed, 0)::numeric, 1)                       AS alloted_g,
       ROUND(COALESCE(a.bought_g, 0)::numeric, 1)                                 AS bought_g,
       CASE
         WHEN COALESCE(a.allotted_g_elapsed, 0) <= 0 THEN NULL
@@ -447,6 +447,13 @@ function computeHealthRow(
 
   const hasPlan = repeats != null || allottedG != null;
   const repeatCount = repeats;
+  // Completed repeat cycles, NOT the plan's granted entitlement (repeatCount
+  // above, shown as the "repeats" field/REPEATS column). A freshly-issued
+  // 6-repeat script has repeatCount=6 from the moment it's created, even
+  // though the patient hasn't gone through a single cycle yet -- using
+  // repeatCount for the "3+ repeat cycles" purple criterion would wrongly
+  // flag a brand-new patient as an established repeat customer.
+  const completedRepeats = repeats != null && repeatsRemainingActive != null ? repeats - repeatsRemainingActive : null;
   const purchaseRatePct = shop?.purchase_rate_pct != null ? Number(shop.purchase_rate_pct) : null;
   const avgVisitsPerMonth = patient.avg_visits_per_month != null ? Number(patient.avg_visits_per_month) : null;
 
@@ -468,7 +475,7 @@ function computeHealthRow(
 
   const isPurpleGrams75110 = adherencePct != null && adherencePct >= 75 && adherencePct <= 110;
   const isPurpleRecentPurchase30 = daysSinceActivity != null && daysSinceActivity <= 30;
-  const isPurpleRepeatCount3 = (repeatCount ?? 0) >= 3;
+  const isPurpleRepeatCount3 = (completedRepeats ?? 0) >= 3;
   const consultationCurrent = !needsUpdate && (daysOverdue == null || daysOverdue < 0);
 
   const isGreenGrams5075 = adherencePct != null && adherencePct >= 50 && adherencePct <= 75;
@@ -477,7 +484,7 @@ function computeHealthRow(
   let adherenceGroup: string | null;
   if (adherencePct == null) {
     adherenceGroup = hasPlan ? "red" : null;
-  } else if (adherencePct >= 75 && (repeatCount ?? 0) >= 3 && (purchaseRatePct ?? 100) >= 60) {
+  } else if (adherencePct >= 75 && (completedRepeats ?? 0) >= 3 && (purchaseRatePct ?? 100) >= 60) {
     adherenceGroup = "purple";
   } else if (adherencePct >= 50) {
     adherenceGroup = "green";
