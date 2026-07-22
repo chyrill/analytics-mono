@@ -196,28 +196,34 @@ function buildSupplyHistoryQuery() {
     ),
     adherence AS (
       -- Adherence scoped to the WHOLE chain (year-to-date), counting ONLY
-      -- windows that have FULLY elapsed (window_end <= today). We
-      -- deliberately do NOT scope this to just the current plan segment's
-      -- source_id: a plan revision (quantity change/switch/extension) can
-      -- land mid-chain and still have plenty of the patient's real purchase
-      -- history sitting under earlier segments of the same chain. Scoping
-      -- to "current segment only" either zeroes out a freshly-revised but
+      -- windows that have STARTED (window_start <= today). We deliberately
+      -- do NOT scope this to just the current plan segment's source_id: a
+      -- plan revision (quantity change/switch/extension) can land mid-chain
+      -- and still have plenty of the patient's real purchase history
+      -- sitting under earlier segments of the same chain. Scoping to
+      -- "current segment only" either zeroes out a freshly-revised but
       -- previously-adherent patient (nothing elapsed yet), or silently
       -- under-counts a patient whose current segment has SOME but not all
       -- of their purchase history (e.g. most of it happened under an
       -- earlier segment). Chain-wide, year-to-date is the accurate picture.
-      -- Gate on window_end (when the window closed), not window_start: a
-      -- window that started in late December but closed in early January
-      -- still represents a fill that "happened" this year, and excluding it
-      -- by window_start silently drops a whole elapsed window's worth of
-      -- target/actual grams from the YTD figures.
+      -- Use window_start (not window_end) for the "has this window
+      -- happened yet" check: a patient can already have fully purchased a
+      -- window's grams before its theoretical window_end (the next
+      -- scheduled refill date) arrives -- gating on window_end <= today
+      -- would silently exclude that already-purchased window until its
+      -- close date passes. Gate the year lower bound on window_end (when
+      -- the window closes), not window_start: a window that started in
+      -- late December but closes in early January still represents a fill
+      -- that "happens" this year, and excluding it by window_start would
+      -- silently drop a whole window's worth of target/actual grams from
+      -- the YTD figures.
       SELECT
         sth.email,
         SUM(sth.grams_target)                                                                    AS allotted_g_elapsed,
         SUM(sth.grams_actual)                                                                     AS bought_g
       FROM supply_tracking_history sth
       JOIN latest l ON l.chain_id = sth.chain_id
-      WHERE sth.window_end >= date_trunc('year', CURRENT_DATE) AND sth.window_end <= CURRENT_DATE
+      WHERE sth.window_end >= date_trunc('year', CURRENT_DATE) AND sth.window_start <= CURRENT_DATE
       GROUP BY sth.email
     )
     SELECT
