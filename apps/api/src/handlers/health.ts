@@ -206,13 +206,18 @@ function buildSupplyHistoryQuery() {
       -- under-counts a patient whose current segment has SOME but not all
       -- of their purchase history (e.g. most of it happened under an
       -- earlier segment). Chain-wide, year-to-date is the accurate picture.
+      -- Gate on window_end (when the window closed), not window_start: a
+      -- window that started in late December but closed in early January
+      -- still represents a fill that "happened" this year, and excluding it
+      -- by window_start silently drops a whole elapsed window's worth of
+      -- target/actual grams from the YTD figures.
       SELECT
         sth.email,
         SUM(sth.grams_target)                                                                    AS allotted_g_elapsed,
         SUM(sth.grams_actual)                                                                     AS bought_g
       FROM supply_tracking_history sth
       JOIN latest l ON l.chain_id = sth.chain_id
-      WHERE sth.window_start >= date_trunc('year', CURRENT_DATE) AND sth.window_end <= CURRENT_DATE
+      WHERE sth.window_end >= date_trunc('year', CURRENT_DATE) AND sth.window_end <= CURRENT_DATE
       GROUP BY sth.email
     )
     SELECT
