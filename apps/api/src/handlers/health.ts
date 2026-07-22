@@ -195,17 +195,28 @@ function buildSupplyHistoryQuery() {
       GROUP BY sth.email
     ),
     adherence AS (
-      -- Adherence scoped to the WHOLE chain (year-to-date), counting ONLY
+      -- Adherence scoped to the WHOLE PATIENT (year-to-date), counting ONLY
       -- windows that have STARTED (window_start <= today). We deliberately
       -- do NOT scope this to just the current plan segment's source_id: a
       -- plan revision (quantity change/switch/extension) can land mid-chain
       -- and still have plenty of the patient's real purchase history
-      -- sitting under earlier segments of the same chain. Scoping to
-      -- "current segment only" either zeroes out a freshly-revised but
-      -- previously-adherent patient (nothing elapsed yet), or silently
-      -- under-counts a patient whose current segment has SOME but not all
-      -- of their purchase history (e.g. most of it happened under an
-      -- earlier segment). Chain-wide, year-to-date is the accurate picture.
+      -- sitting under earlier segments. Scoping to "current segment only"
+      -- either zeroes out a freshly-revised but previously-adherent patient
+      -- (nothing elapsed yet), or silently under-counts a patient whose
+      -- current segment has SOME but not all of their purchase history
+      -- (e.g. most of it happened under an earlier segment).
+      --
+      -- Join on EMAIL, not chain_id: build-supply-tracking-history.ts starts
+      -- a brand new chain_id (email::plan_date) on every UNRECOGNIZED_PLAN_
+      -- CHANGE reset, so chain_id boundaries do NOT reliably span a
+      -- patient's whole purchase history -- a reset can silently orphan
+      -- every prior window from this sum. Since the rebuild script fully
+      -- deletes+reinserts all rows for a given email on every run, every
+      -- row currently in the table for an email belongs to the same single
+      -- continuous walk of that patient's history, regardless of how many
+      -- chain_id/source_id resets happened along the way. Email is the only
+      -- boundary that's guaranteed to be stable and complete.
+      --
       -- Use window_start (not window_end) for the "has this window
       -- happened yet" check: a patient can already have fully purchased a
       -- window's grams before its theoretical window_end (the next
@@ -222,7 +233,6 @@ function buildSupplyHistoryQuery() {
         SUM(sth.grams_target)                                                                    AS allotted_g_elapsed,
         SUM(sth.grams_actual)                                                                     AS bought_g
       FROM supply_tracking_history sth
-      JOIN latest l ON l.chain_id = sth.chain_id
       WHERE sth.window_end >= date_trunc('year', CURRENT_DATE) AND sth.window_start <= CURRENT_DATE
       GROUP BY sth.email
     )
