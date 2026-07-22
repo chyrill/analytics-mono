@@ -166,6 +166,7 @@ interface SupplyHistoryRow {
   alloted_g: number | null;
   bought_g: number | null;
   adherence_pct: number | null;
+  completed_cycles: number | null;
 }
 
 function buildSupplyHistoryQuery() {
@@ -195,17 +196,28 @@ function buildSupplyHistoryQuery() {
       GROUP BY sth.email
     ),
     adherence AS (
-      -- Adherence scoped to the WHOLE chain (year-to-date), counting ONLY
+      -- Adherence scoped to the WHOLE PATIENT (year-to-date), counting ONLY
       -- windows that have STARTED (window_start <= today). We deliberately
       -- do NOT scope this to just the current plan segment's source_id: a
       -- plan revision (quantity change/switch/extension) can land mid-chain
       -- and still have plenty of the patient's real purchase history
-      -- sitting under earlier segments of the same chain. Scoping to
-      -- "current segment only" either zeroes out a freshly-revised but
-      -- previously-adherent patient (nothing elapsed yet), or silently
-      -- under-counts a patient whose current segment has SOME but not all
-      -- of their purchase history (e.g. most of it happened under an
-      -- earlier segment). Chain-wide, year-to-date is the accurate picture.
+      -- sitting under earlier segments. Scoping to "current segment only"
+      -- either zeroes out a freshly-revised but previously-adherent patient
+      -- (nothing elapsed yet), or silently under-counts a patient whose
+      -- current segment has SOME but not all of their purchase history
+      -- (e.g. most of it happened under an earlier segment).
+      --
+      -- Join on EMAIL, not chain_id: build-supply-tracking-history.ts starts
+      -- a brand new chain_id (email::plan_date) on every UNRECOGNIZED_PLAN_
+      -- CHANGE reset, so chain_id boundaries do NOT reliably span a
+      -- patient's whole purchase history -- a reset can silently orphan
+      -- every prior window from this sum. Since the rebuild script fully
+      -- deletes+reinserts all rows for a given email on every run, every
+      -- row currently in the table for an email belongs to the same single
+      -- continuous walk of that patient's history, regardless of how many
+      -- chain_id/source_id resets happened along the way. Email is the only
+      -- boundary that's guaranteed to be stable and complete.
+      --
       -- Use window_start (not window_end) for the "has this window
       -- happened yet" check: a patient can already have fully purchased a
       -- window's grams before its theoretical window_end (the next
@@ -222,8 +234,20 @@ function buildSupplyHistoryQuery() {
         SUM(sth.grams_target)                                                                    AS allotted_g_elapsed,
         SUM(sth.grams_actual)                                                                     AS bought_g
       FROM supply_tracking_history sth
-      JOIN latest l ON l.chain_id = sth.chain_id
       WHERE sth.window_end >= date_trunc('year', CURRENT_DATE) AND sth.window_start <= CURRENT_DATE
+      GROUP BY sth.email
+    ),
+    cycles AS (
+      -- Completed repeat cycles, whole-patient, ALL-TIME (not YTD -- an
+      -- established multi-year patient shouldn't reset to 0 every January).
+      -- Also joined on email, not chain_id/source_id, for the same reason as
+      -- the adherence CTE above: chain_id resets on every UNRECOGNIZED_PLAN_
+      -- CHANGE, which would otherwise make a long-time patient look brand
+      -- new right after a reset even though they've filled many cycles.
+      SELECT
+        sth.email,
+        COUNT(*) FILTER (WHERE sth.window_end <= CURRENT_DATE)                                  AS completed_cycles
+      FROM supply_tracking_history sth
       GROUP BY sth.email
     )
     SELECT
@@ -234,14 +258,15 @@ function buildSupplyHistoryQuery() {
       l.grams_target                                                             AS supply_interval_total_active,
       l.flagged                                                                  AS needs_update,
       pa.script_expiration_date,
-      -- Total fills under this plan = the initial dispense + repeats refills
-      -- (windows are generated for fill_index 0..repeats inclusive, i.e.
-      -- repeats+1 windows -- see generateWindows()/startChain() in
-      -- build-supply-tracking-history.ts). Using repeats alone here would
-      -- under-count by exactly one window's grams, which can make a
-      -- still-adherent patient look like they've "used up" their full
-      -- allotment when they haven't.
-      ROUND((l.grams_target * (pa.repeats + 1))::numeric, 1)                     AS alloted_g,
+      COALESCE(c.completed_cycles, 0)                                            AS completed_cycles,
+      -- Must be the SAME scope as bought_g (whole-email YTD elapsed sum,
+      -- from the adherence CTE) -- NOT the current plan segment's full
+      -- entitlement (grams_target * (repeats+1)). A fresh plan segment
+      -- with barely any elapsed windows would otherwise show its full
+      -- multi-repeat entitlement as "allotted" next to a YTD-scoped
+      -- "bought", making the two figures incomparable (e.g. a brand new
+      -- 6-repeat plan showing 196g allotted after only 28g has elapsed).
+      ROUND(COALESCE(a.allotted_g_elapsed, 0)::numeric, 1)                       AS alloted_g,
       ROUND(COALESCE(a.bought_g, 0)::numeric, 1)                                 AS bought_g,
       CASE
         WHEN COALESCE(a.allotted_g_elapsed, 0) <= 0 THEN NULL
@@ -250,6 +275,7 @@ function buildSupplyHistoryQuery() {
     FROM latest l
     JOIN plan_agg pa ON pa.email = l.email
     LEFT JOIN adherence a ON a.email = l.email
+    LEFT JOIN cycles c ON c.email = l.email
   `);
 }
 
@@ -437,6 +463,27 @@ function computeHealthRow(
 
   const hasPlan = repeats != null || allottedG != null;
   const repeatCount = repeats;
+  // Completed repeat cycles, NOT the plan's granted entitlement (repeatCount
+  // above, shown as the "repeats" field/REPEATS column). A freshly-issued
+  // 6-repeat script has repeatCount=6 from the moment it's created, even
+  // though the patient hasn't gone through a single cycle yet -- using
+  // repeatCount for the "3+ repeat cycles" purple criterion would wrongly
+  // flag a brand-new patient as an established repeat customer.
+  //
+  // Use the whole-email, all-time completed_cycles count from
+  // supply_tracking_history (see the `cycles` CTE in buildSupplyHistoryQuery)
+  // rather than (current plan segment's repeats - repeats_remaining_active):
+  // that segment-scoped subtraction resets to ~0 on every
+  // UNRECOGNIZED_PLAN_CHAIN reset, which would wrongly make a long-time,
+  // many-cycles patient look brand new right after a reset (e.g. Graeme,
+  // Federico -- both had several completed cycles under an earlier chain
+  // before the most recent reset).
+  const completedRepeats =
+    supplyHistory?.completed_cycles != null
+      ? Number(supplyHistory.completed_cycles)
+      : repeats != null && repeatsRemainingActive != null
+        ? repeats - repeatsRemainingActive
+        : null;
   const purchaseRatePct = shop?.purchase_rate_pct != null ? Number(shop.purchase_rate_pct) : null;
   const avgVisitsPerMonth = patient.avg_visits_per_month != null ? Number(patient.avg_visits_per_month) : null;
 
@@ -458,7 +505,7 @@ function computeHealthRow(
 
   const isPurpleGrams75110 = adherencePct != null && adherencePct >= 75 && adherencePct <= 110;
   const isPurpleRecentPurchase30 = daysSinceActivity != null && daysSinceActivity <= 30;
-  const isPurpleRepeatCount3 = (repeatCount ?? 0) >= 3;
+  const isPurpleRepeatCount3 = (completedRepeats ?? 0) >= 3;
   const consultationCurrent = !needsUpdate && (daysOverdue == null || daysOverdue < 0);
 
   const isGreenGrams5075 = adherencePct != null && adherencePct >= 50 && adherencePct <= 75;
@@ -467,7 +514,7 @@ function computeHealthRow(
   let adherenceGroup: string | null;
   if (adherencePct == null) {
     adherenceGroup = hasPlan ? "red" : null;
-  } else if (adherencePct >= 75 && (repeatCount ?? 0) >= 3 && (purchaseRatePct ?? 100) >= 60) {
+  } else if (adherencePct >= 75 && (completedRepeats ?? 0) >= 3 && (purchaseRatePct ?? 100) >= 60) {
     adherenceGroup = "purple";
   } else if (adherencePct >= 50) {
     adherenceGroup = "green";
