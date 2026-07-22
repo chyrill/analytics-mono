@@ -274,9 +274,24 @@ function aggregateByLineField(orders: ReturnType<typeof groupOrders>, pick: (lin
     .sort((a, b) => b.total_grams - a.total_grams);
 }
 
-/** Products bought: purchase count + total grams per product. */
+/** Products bought: purchase count + total grams + cut per product. */
 function aggregateProductsSummary(orders: ReturnType<typeof groupOrders>) {
-  return aggregateByLineField(orders, (l) => l.product_name).map(({ label, ...rest }) => ({ product_name: label, ...rest }));
+  const totals = new Map<string, { purchase_count: number; total_grams: number; cut: string | null }>();
+  for (const order of orders) {
+    for (const line of order.lines) {
+      if (line.product_name && NON_PRODUCT_LINE_NAMES.has(line.product_name.trim().toLowerCase())) continue;
+      const label = line.product_name;
+      if (!label) continue;
+      const entry = totals.get(label) ?? { purchase_count: 0, total_grams: 0, cut: null };
+      entry.purchase_count += 1;
+      entry.total_grams += line.grams ?? 0;
+      if (entry.cut == null && line.cut) entry.cut = line.cut;
+      totals.set(label, entry);
+    }
+  }
+  return Array.from(totals.entries())
+    .map(([label, v]) => ({ product_name: label, purchase_count: v.purchase_count, total_grams: v.total_grams, cut: v.cut }))
+    .sort((a, b) => b.total_grams - a.total_grams);
 }
 
 /** Strains explored: purchase count + total grams per strain — powers the strains pie chart. */

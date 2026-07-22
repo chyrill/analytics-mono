@@ -68,7 +68,7 @@ interface PatientOrderDetail {
   };
   strains_explored: string[];
   supply_history: { window_start: string; window_end: string; grams_target: number; grams_actual: number }[];
-  products_summary: { product_name: string; purchase_count: number; total_grams: number }[];
+  products_summary: { product_name: string; purchase_count: number; total_grams: number; cut: string | null }[];
   strains_summary: { strain: string; purchase_count: number; total_grams: number }[];
   total_spend: number;
 }
@@ -909,6 +909,7 @@ function ProductsSummaryTable({ products }: { products: PatientOrderDetail["prod
         <thead>
           <tr>
             <th style={th}>Product</th>
+            <th style={th}>Cut</th>
             <th style={th}>Times bought</th>
             <th style={th}>Total grams</th>
           </tr>
@@ -917,6 +918,7 @@ function ProductsSummaryTable({ products }: { products: PatientOrderDetail["prod
           {products.map((p) => (
             <tr key={p.product_name}>
               <td style={{ ...td, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={p.product_name}>{p.product_name}</td>
+              <td style={td}>{p.cut ?? "—"}</td>
               <td style={td}>{p.purchase_count}</td>
               <td style={td}>{p.total_grams.toFixed(1)}g</td>
             </tr>
