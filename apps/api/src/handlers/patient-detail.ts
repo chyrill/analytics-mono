@@ -227,11 +227,17 @@ function attachOrderMetrics(orders: ReturnType<typeof groupOrders>, allottedG: n
   });
 }
 
+// Saleor order lines that represent checkout fees/surcharges rather than an
+// actual product/strain the patient bought — excluded from the products and
+// strains breakdowns shown in the drilldown panel.
+const NON_PRODUCT_LINE_NAMES = new Set(["payment fees"]);
+
 /** Per-line-item totals (purchase count + grams bought), keyed by `pick`. */
 function aggregateByLineField(orders: ReturnType<typeof groupOrders>, pick: (line: ReturnType<typeof groupOrders>[number]["lines"][number]) => string | null) {
   const totals = new Map<string, { purchase_count: number; total_grams: number }>();
   for (const order of orders) {
     for (const line of order.lines) {
+      if (line.product_name && NON_PRODUCT_LINE_NAMES.has(line.product_name.trim().toLowerCase())) continue;
       const label = pick(line);
       if (!label) continue;
       const entry = totals.get(label) ?? { purchase_count: 0, total_grams: 0 };

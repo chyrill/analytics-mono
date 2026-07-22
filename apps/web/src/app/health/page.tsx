@@ -321,17 +321,6 @@ declare const Chart: {
   new(ctx: CanvasRenderingContext2D, config: Record<string, unknown>): { destroy(): void };
 };
 
-const CHART_OPTS = {
-  plugins: { legend: { display: false }, tooltip: { backgroundColor: "#1a1a1a", borderColor: "#333", borderWidth: 1, titleColor: "#aaa", bodyColor: "#fff", padding: 10 } },
-  scales: {
-    x: { grid: { color: "#1a1a1a" }, ticks: { color: "#555", font: { size: 11 } } },
-    y: { grid: { color: "#1a1a1a" }, ticks: { color: "#555", font: { size: 11 } } },
-  },
-  animation: { duration: 300 },
-  responsive: true,
-  maintainAspectRatio: false,
-};
-
 // ── Main component ─────────────────────────────────────────────────────────────
 export default function HealthIndexPage() {
   const [allRows, setAllRows] = useState<HealthRow[]>([]);
@@ -796,9 +785,7 @@ function daysFromNow(dateStr: string | null): number | null {
 }
 
 function PatientAllowanceSummary({ detail }: { detail: PatientOrderDetail }) {
-  const { allowance, cadence, current_plan, strains_explored, stale, supply_history, products_summary, strains_summary } = detail;
-  const runOutDays = daysFromNow(allowance.predicted_run_out_date);
-  const atRisk = runOutDays != null && runOutDays <= 14;
+  const { allowance, cadence, current_plan, stale, supply_history, products_summary, strains_summary } = detail;
   const planEndDays = daysFromNow(current_plan?.end_date ?? null);
 
   return (
@@ -821,30 +808,6 @@ function PatientAllowanceSummary({ detail }: { detail: PatientOrderDetail }) {
           <span style={{ color: "#f87171" }}>No active plan</span>
         )}
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-        <div style={{ background: atRisk ? "#1f1400" : "#1a1a1a", border: atRisk ? "1px solid #3d2e00" : "1px solid #222", borderRadius: 6, padding: "12px 14px" }}>
-          <div style={{ fontSize: 10, color: atRisk ? "#fbbf24" : "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>
-            {atRisk ? "⚠ At risk" : "Depletion"}
-          </div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: atRisk ? "#fbbf24" : "#fff", marginTop: 6 }}>
-            {allowance.remaining_g != null ? `${allowance.remaining_g.toFixed(1)}g left` : "—"}
-          </div>
-          <div style={{ fontSize: 11, color: "#555", marginTop: 4 }}>
-            {allowance.predicted_run_out_date
-              ? `predicted run-out ${new Date(allowance.predicted_run_out_date).toLocaleDateString("en-AU")}`
-              : "not enough order history to predict"}
-          </div>
-        </div>
-        <div style={{ background: "#1a1a1a", border: "1px solid #222", borderRadius: 6, padding: "12px 14px" }}>
-          <div style={{ fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>Strains explored</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: "#fff", marginTop: 6 }}>{strains_explored.length || "—"}</div>
-          {strains_explored.length > 0 && (
-            <div style={{ fontSize: 11, color: "#666", marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {strains_explored.join(", ")}
-            </div>
-          )}
-        </div>
-      </div>
       <div style={{ fontSize: 11, color: "#555", marginTop: 10 }}>
         {current_plan?.outcome ? `Plan: ${current_plan.outcome}` : "No active plan"}
         {current_plan?.date && ` · approved ${new Date(current_plan.date).toLocaleDateString("en-AU")}`}
@@ -859,7 +822,7 @@ function PatientAllowanceSummary({ detail }: { detail: PatientOrderDetail }) {
       </CollapsibleSection>
 
       <CollapsibleSection title="Products & strains">
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <ProductsSummaryTable products={products_summary} />
           <StrainsPieChart strains={strains_summary} />
         </div>
@@ -1065,69 +1028,15 @@ function OrderHistoryTable({ orders }: { orders: PatientOrderDetail["orders"] })
   );
 }
 
-// ── Detail charts ──────────────────────────────────────────────────────────────
+// ── Detail summary (spend only — visit/grams charts removed) ──────────────────
 function DetailCharts({ detail }: { detail: DetailData }) {
-  const visitsRef = useRef<HTMLCanvasElement>(null);
-  const gramsRef = useRef<HTMLCanvasElement>(null);
-  const spendRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    if (typeof Chart === "undefined") return;
-    const charts: { destroy(): void }[] = [];
-
-    if (visitsRef.current) {
-      const ctx = visitsRef.current.getContext("2d");
-      if (ctx) charts.push(new Chart(ctx, {
-        type: "bar",
-        data: {
-          labels: detail.visitsByMonth.map((r) => r.month),
-          datasets: [
-            { label: "Visits", data: detail.visitsByMonth.map((r) => r.visits), backgroundColor: "#2d2d4a", borderRadius: 3 },
-            { label: "Purchases", data: detail.visitsByMonth.map((r) => r.purchases), backgroundColor: "#818cf8", borderRadius: 3 },
-          ],
-        },
-        options: { ...CHART_OPTS, plugins: { ...CHART_OPTS.plugins, legend: { display: true, labels: { color: "#555", font: { size: 11 } } } } },
-      }));
-    }
-
-    if (gramsRef.current && detail.gramsByMonth.length > 0) {
-      const ctx = gramsRef.current.getContext("2d");
-      if (ctx) charts.push(new Chart(ctx, {
-        type: "bar",
-        data: {
-          labels: detail.gramsByMonth.map((r) => r.month),
-          datasets: [
-            { label: "Used (g)", data: detail.gramsByMonth.map((r) => r.used_g), backgroundColor: "#2e2040", borderRadius: 3 },
-          ],
-        },
-        options: { ...CHART_OPTS, scales: { ...CHART_OPTS.scales, y: { ...CHART_OPTS.scales.y, ticks: { ...CHART_OPTS.scales.y.ticks, callback: (v: unknown) => `${v}g` } } } },
-      }));
-    }
-
-    if (spendRef.current && detail.spendByMonth.length > 0) {
-      const ctx = spendRef.current.getContext("2d");
-      if (ctx) charts.push(new Chart(ctx, {
-        type: "bar",
-        data: {
-          labels: detail.spendByMonth.map((r) => r.month),
-          datasets: [{ label: "Spend ($)", data: detail.spendByMonth.map((r) => r.total_spent), backgroundColor: "#1a3d2e", borderRadius: 3 }],
-        },
-        options: { ...CHART_OPTS, scales: { ...CHART_OPTS.scales, y: { ...CHART_OPTS.scales.y, ticks: { ...CHART_OPTS.scales.y.ticks, callback: (v: unknown) => `$${v}` } } } },
-      }));
-    }
-
-    return () => charts.forEach((c) => c.destroy());
-  }, [detail]);
-
   return (
     <div style={{ padding: "20px 24px" }}>
       {/* Summary row */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12, marginBottom: 24 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
         {[
           ["Total spent", `$${parseFloat(detail.summary.total_spent).toLocaleString("en-AU", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`],
           ["Avg monthly", `$${parseFloat(detail.summary.avg_monthly_spend).toLocaleString("en-AU", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`],
-          ["Total visits", String(detail.summary.total_visits)],
-          ["Avg grams/fill", `${detail.summary.avg_grams_per_interval}g`],
         ].map(([label, val]) => (
           <div key={label} style={{ background: "#1a1a1a", borderRadius: 6, padding: "12px 14px" }}>
             <div style={{ fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>{label}</div>
@@ -1135,28 +1044,6 @@ function DetailCharts({ detail }: { detail: DetailData }) {
           </div>
         ))}
       </div>
-
-      {/* Chart: visits */}
-      <div style={{ marginBottom: 20 }}>
-        <div style={{ fontSize: 11, color: "#555", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 12 }}>Monthly Visits vs Purchases</div>
-        <div style={{ position: "relative", height: 160 }}><canvas ref={visitsRef} /></div>
-      </div>
-
-      {/* Chart: grams */}
-      {detail.gramsByMonth.length > 0 && (
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ fontSize: 11, color: "#555", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 12 }}>Saleor Grams by Month</div>
-          <div style={{ position: "relative", height: 160 }}><canvas ref={gramsRef} /></div>
-        </div>
-      )}
-
-      {/* Chart: spend */}
-      {detail.spendByMonth.length > 0 && (
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ fontSize: 11, color: "#555", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 12 }}>Monthly Spend ($)</div>
-          <div style={{ position: "relative", height: 160 }}><canvas ref={spendRef} /></div>
-        </div>
-      )}
     </div>
   );
 }
