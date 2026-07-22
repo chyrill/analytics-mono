@@ -58,6 +58,8 @@ interface PatientOrderDetail {
     outcome: string | null;
     date: string | null;
     active_strength: { supply_interval: number | null } | null;
+    start_date: string | null;
+    end_date: string | null;
   } | null;
   allowance: {
     allotted_g: number | null;
@@ -65,6 +67,10 @@ interface PatientOrderDetail {
     predicted_run_out_date: string | null;
   };
   strains_explored: string[];
+  supply_history: { window_start: string; window_end: string; grams_target: number; grams_actual: number }[];
+  products_summary: { product_name: string; purchase_count: number; total_grams: number }[];
+  strains_summary: { strain: string; purchase_count: number; total_grams: number }[];
+  total_spend: number;
 }
 
 interface HealthDataResponse {
@@ -790,9 +796,10 @@ function daysFromNow(dateStr: string | null): number | null {
 }
 
 function PatientAllowanceSummary({ detail }: { detail: PatientOrderDetail }) {
-  const { allowance, cadence, current_plan, strains_explored, stale } = detail;
+  const { allowance, cadence, current_plan, strains_explored, stale, supply_history, products_summary, strains_summary } = detail;
   const runOutDays = daysFromNow(allowance.predicted_run_out_date);
   const atRisk = runOutDays != null && runOutDays <= 14;
+  const planEndDays = daysFromNow(current_plan?.end_date ?? null);
 
   return (
     <div style={{ padding: "16px 24px", borderBottom: "1px solid #1e1e1e" }}>
@@ -801,6 +808,19 @@ function PatientAllowanceSummary({ detail }: { detail: PatientOrderDetail }) {
           ⚠ Live allowance unavailable — showing last synced data
         </div>
       )}
+      <div style={{ fontSize: 12, marginBottom: 12 }}>
+        {current_plan?.start_date ? (
+          <span style={{ color: "#ccc" }}>
+            Plan: {new Date(current_plan.start_date).toLocaleDateString("en-AU")}
+            {current_plan.end_date && ` – ${new Date(current_plan.end_date).toLocaleDateString("en-AU")}`}
+            {planEndDays != null && (
+              <span style={{ color: planEndDays <= 14 ? "#fbbf24" : "#555" }}> ({planEndDays >= 0 ? `${planEndDays} days left` : "ended"})</span>
+            )}
+          </span>
+        ) : (
+          <span style={{ color: "#f87171" }}>No active plan</span>
+        )}
+      </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
         <div style={{ background: atRisk ? "#1f1400" : "#1a1a1a", border: atRisk ? "1px solid #3d2e00" : "1px solid #222", borderRadius: 6, padding: "12px 14px" }}>
           <div style={{ fontSize: 10, color: atRisk ? "#fbbf24" : "#555", textTransform: "uppercase", letterSpacing: "0.4px" }}>
@@ -833,9 +853,160 @@ function PatientAllowanceSummary({ detail }: { detail: PatientOrderDetail }) {
         {cadence.avg_orders_per_month != null && ` · ${cadence.avg_orders_per_month.toFixed(1)} orders/mo`}
         {cadence.avg_days_between_orders != null && ` · ${cadence.avg_days_between_orders.toFixed(0)}d between orders`}
       </div>
-      <OrderHistoryTable orders={detail.orders} />
+
+      <CollapsibleSection title="Supply history (since Jan 2026)" defaultOpen>
+        <SupplyHistoryTable history={supply_history} />
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Products & strains">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <ProductsSummaryTable products={products_summary} />
+          <StrainsPieChart strains={strains_summary} />
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection title={`Order history (${detail.orders.length})`}>
+        <OrderHistoryTable orders={detail.orders} />
+      </CollapsibleSection>
     </div>
   );
+}
+
+// ── Collapsible section wrapper — keeps the drilldown panel scannable as
+// more sections get added below the fold. ──────────────────────────────────────
+function CollapsibleSection({ title, defaultOpen, children }: { title: string; defaultOpen?: boolean; children: React.ReactNode }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  return (
+    <div style={{ marginTop: 12, border: "1px solid #222", borderRadius: 6, overflow: "hidden" }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#181818", border: "none", color: "#ccc", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.4px", padding: "8px 12px", cursor: "pointer" }}
+      >
+        {title}
+        <span style={{ color: "#555" }}>{open ? "▾" : "▸"}</span>
+      </button>
+      {open && <div style={{ padding: 12 }}>{children}</div>}
+    </div>
+  );
+}
+
+// ── Supply-tracking-history interval table ────────────────────────────────────
+function SupplyHistoryTable({ history }: { history: PatientOrderDetail["supply_history"] }) {
+  if (history.length === 0) {
+    return <div style={{ fontSize: 11, color: "#555" }}>No supply intervals recorded since Jan 2026.</div>;
+  }
+
+  const th: CSSProperties = {
+    textAlign: "left", fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px",
+    padding: "6px 8px", borderBottom: "1px solid #222", position: "sticky", top: 0, background: "#141414",
+  };
+  const td: CSSProperties = { fontSize: 12, color: "#ccc", padding: "6px 8px", borderBottom: "1px solid #1a1a1a" };
+
+  return (
+    <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid #222", borderRadius: 6 }}>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead>
+          <tr>
+            <th style={th}>Start</th>
+            <th style={th}>End</th>
+            <th style={th}>Target (g)</th>
+            <th style={th}>Actual (g)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {history.map((row, i) => (
+            <tr key={`${row.window_start}-${i}`}>
+              <td style={td}>{new Date(row.window_start).toLocaleDateString("en-AU")}</td>
+              <td style={td}>{new Date(row.window_end).toLocaleDateString("en-AU")}</td>
+              <td style={td}>{row.grams_target.toFixed(1)}g</td>
+              <td style={td}>{row.grams_actual.toFixed(1)}g</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Products-bought table ─────────────────────────────────────────────────────
+function ProductsSummaryTable({ products }: { products: PatientOrderDetail["products_summary"] }) {
+  if (products.length === 0) {
+    return <div style={{ fontSize: 11, color: "#555" }}>No products purchased.</div>;
+  }
+
+  const th: CSSProperties = {
+    textAlign: "left", fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.4px",
+    padding: "6px 8px", borderBottom: "1px solid #222", position: "sticky", top: 0, background: "#141414",
+  };
+  const td: CSSProperties = { fontSize: 12, color: "#ccc", padding: "6px 8px", borderBottom: "1px solid #1a1a1a" };
+
+  return (
+    <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid #222", borderRadius: 6 }}>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead>
+          <tr>
+            <th style={th}>Product</th>
+            <th style={th}>Times bought</th>
+            <th style={th}>Total grams</th>
+          </tr>
+        </thead>
+        <tbody>
+          {products.map((p) => (
+            <tr key={p.product_name}>
+              <td style={{ ...td, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={p.product_name}>{p.product_name}</td>
+              <td style={td}>{p.purchase_count}</td>
+              <td style={td}>{p.total_grams.toFixed(1)}g</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Strains pie chart — falls back to plain text below 2 distinct strains,
+// where a pie chart has nothing meaningful to show. ────────────────────────────
+const PIE_COLORS = ["#818cf8", "#4ade80", "#facc15", "#f87171", "#38bdf8", "#c084fc", "#fb923c", "#2dd4bf"];
+
+function StrainsPieChart({ strains }: { strains: PatientOrderDetail["strains_summary"] }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    if (typeof Chart === "undefined" || strains.length < 2) return;
+    const ctx = canvasRef.current?.getContext("2d");
+    if (!ctx) return;
+    const chart = new Chart(ctx, {
+      type: "pie",
+      data: {
+        labels: strains.map((s) => s.strain),
+        datasets: [{
+          data: strains.map((s) => s.total_grams),
+          backgroundColor: strains.map((_, i) => PIE_COLORS[i % PIE_COLORS.length]),
+          borderColor: "#141414",
+          borderWidth: 2,
+        }],
+      },
+      options: {
+        plugins: {
+          legend: { display: true, position: "right", labels: { color: "#aaa", font: { size: 11 }, boxWidth: 10 } },
+          tooltip: { backgroundColor: "#1a1a1a", borderColor: "#333", borderWidth: 1, titleColor: "#aaa", bodyColor: "#fff", padding: 10 },
+        },
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 300 },
+      },
+    });
+    return () => chart.destroy();
+  }, [strains]);
+
+  if (strains.length === 0) {
+    return <div style={{ fontSize: 11, color: "#555" }}>No strain data.</div>;
+  }
+  if (strains.length === 1) {
+    const only = strains[0];
+    return <div style={{ fontSize: 12, color: "#ccc" }}>Primary strain: {only.strain} (100% · {only.total_grams.toFixed(1)}g)</div>;
+  }
+  return <div style={{ position: "relative", height: 180 }}><canvas ref={canvasRef} /></div>;
 }
 
 // ── Per-order history table ───────────────────────────────────────────────────

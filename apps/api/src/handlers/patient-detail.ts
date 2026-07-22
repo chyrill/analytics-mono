@@ -25,6 +25,10 @@ function err(msg: string, status = 400): APIGatewayProxyStructuredResultV2 {
 // used elsewhere in the analytics DB for "live" plans).
 const INACTIVE_OUTCOMES = ["Reject", "No Show", "No Response"];
 
+// Supply history table only surfaces intervals from this date forward —
+// matches the reporting window requested for the patient drilldown.
+const SUPPLY_HISTORY_SINCE = "2026-01-01";
+
 interface OrderLineRow {
   order_id: string;
   order_number: number | null;
@@ -41,6 +45,13 @@ interface OrderLineRow {
   cut: string | null;
   line_grams: string | null;
   line_quantity: number | null;
+}
+
+interface SupplyHistoryRow {
+  window_start: string;
+  window_end: string;
+  grams_target: string;
+  grams_actual: string;
 }
 
 interface CurrentPlanRow {
@@ -107,6 +118,21 @@ function buildCurrentPlanQuery(safeEmail: string) {
       AND (outcome IS NULL OR outcome NOT IN (${outcomeList}))
     ORDER BY date DESC
     LIMIT 1
+  `);
+}
+
+/**
+ * Supply-tracking intervals (target vs actual grams per fill window) since
+ * SUPPLY_HISTORY_SINCE. supply_tracking_history is independently computed
+ * from db_treatment_plans + saleor orders — see packages/db/src/schema/supply-tracking-history.ts.
+ */
+function buildSupplyHistoryQuery(safeEmail: string) {
+  return sql.raw(`
+    SELECT window_start, window_end, grams_target, grams_actual
+    FROM supply_tracking_history
+    WHERE email = '${safeEmail}'
+      AND window_start >= '${SUPPLY_HISTORY_SINCE}'
+    ORDER BY window_start ASC
   `);
 }
 
@@ -201,6 +227,34 @@ function attachOrderMetrics(orders: ReturnType<typeof groupOrders>, allottedG: n
   });
 }
 
+/** Per-line-item totals (purchase count + grams bought), keyed by `pick`. */
+function aggregateByLineField(orders: ReturnType<typeof groupOrders>, pick: (line: ReturnType<typeof groupOrders>[number]["lines"][number]) => string | null) {
+  const totals = new Map<string, { purchase_count: number; total_grams: number }>();
+  for (const order of orders) {
+    for (const line of order.lines) {
+      const label = pick(line);
+      if (!label) continue;
+      const entry = totals.get(label) ?? { purchase_count: 0, total_grams: 0 };
+      entry.purchase_count += 1;
+      entry.total_grams += line.grams ?? 0;
+      totals.set(label, entry);
+    }
+  }
+  return Array.from(totals.entries())
+    .map(([label, v]) => ({ label, purchase_count: v.purchase_count, total_grams: v.total_grams }))
+    .sort((a, b) => b.total_grams - a.total_grams);
+}
+
+/** Products bought: purchase count + total grams per product. */
+function aggregateProductsSummary(orders: ReturnType<typeof groupOrders>) {
+  return aggregateByLineField(orders, (l) => l.product_name).map(({ label, ...rest }) => ({ product_name: label, ...rest }));
+}
+
+/** Strains explored: purchase count + total grams per strain — powers the strains pie chart. */
+function aggregateStrainsSummary(orders: ReturnType<typeof groupOrders>) {
+  return aggregateByLineField(orders, (l) => l.strain).map(({ label, ...rest }) => ({ strain: label, ...rest }));
+}
+
 /** Strength (22/26/29) cascade for the current plan — same priority as docapp-db.ts's tracker cascade. */
 function selectActivePlanStrength(plan: CurrentPlanRow) {
   const tiers: [22 | 26 | 29, CurrentPlanRow][] = [
@@ -253,15 +307,35 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
       allowance = mirrorRows[0] ?? null;
     }
 
-    const [orderLineRows, currentPlanRows] = await Promise.all([
+    const [orderLineRows, currentPlanRows, supplyHistoryRows] = await Promise.all([
       db.execute(buildOrderLinesQuery(safeEmail)),
       db.execute(buildCurrentPlanQuery(safeEmail)),
+      db.execute(buildSupplyHistoryQuery(safeEmail)),
     ]);
 
     const orders = groupOrders(toRows<OrderLineRow>(orderLineRows));
     const cadence = computeCadence(orders);
     const currentPlan = toRows<CurrentPlanRow>(currentPlanRows)[0] ?? null;
     const activePlanStrength = currentPlan ? selectActivePlanStrength(currentPlan) : null;
+
+    // Plan end date isn't a stored column on db_treatment_plans — derive it
+    // from the active strength's supply_interval × number_of_repeat, days
+    // after the plan's start date. Null if either input is missing.
+    const planStartDate = currentPlan?.date ?? null;
+    const planEndDate =
+      planStartDate != null && activePlanStrength?.supply_interval != null && activePlanStrength?.number_of_repeat != null
+        ? new Date(
+          new Date(planStartDate).getTime() +
+            Number(activePlanStrength.supply_interval) * Number(activePlanStrength.number_of_repeat) * MS_PER_DAY,
+        ).toISOString()
+        : null;
+
+    const supplyHistory = toRows<SupplyHistoryRow>(supplyHistoryRows).map((r) => ({
+      window_start: r.window_start,
+      window_end: r.window_end,
+      grams_target: Number(r.grams_target),
+      grams_actual: Number(r.grams_actual),
+    }));
 
     const allottedG =
       allowance?.supply_interval_total_active != null && allowance?.repeats != null
@@ -281,6 +355,9 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
     );
 
     const ordersWithMetrics = attachOrderMetrics(orders, allottedG);
+    const productsSummary = aggregateProductsSummary(orders);
+    const strainsSummary = aggregateStrainsSummary(orders);
+    const totalSpend = orders.reduce((sum, o) => sum + (o.total_amount ?? 0), 0);
 
     return ok({
       email,
@@ -299,6 +376,8 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
           type: currentPlan.type,
           diagnosis: currentPlan.diagnosis,
           active_strength: activePlanStrength,
+          start_date: planStartDate,
+          end_date: planEndDate,
         }
         : null,
       allowance: {
@@ -315,6 +394,10 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
         predicted_run_out_date: predictedRunOutDate,
       },
       strains_explored: strainsExplored,
+      supply_history: supplyHistory,
+      products_summary: productsSummary,
+      strains_summary: strainsSummary,
+      total_spend: totalSpend,
     });
   } catch (e) {
     console.error("[patient-detail]", e);
