@@ -231,6 +231,28 @@ export async function fetchLivePatientHealthData(): Promise<LivePatientHealthRow
 
 export { trackerSelectedCte as buildMirrorTrackerSelectedCte, ADHERENCE_PCT_SQL as MIRROR_ADHERENCE_PCT_SQL };
 
+/**
+ * Fetches just the "real patient" population definition used everywhere else
+ * in this file — doc-app `patient` WHERE "contactId" IS NOT NULL — along with
+ * each patient's full name, without the tracker/visit joins. Used by handlers
+ * (e.g. health2.ts) that need to restrict their own, independently-sourced
+ * rows down to genuine, CRM-synced patients (excludes test/duplicate signups
+ * that never got a contactId), and to display the patient's name.
+ */
+export async function fetchDocAppPatientPopulation(): Promise<Map<string, string | null>> {
+  const sql = getDocAppSql();
+  const rows = await withTimeout(
+    sql.unsafe<{ email: string; full_name: string | null }[]>(`
+      SELECT lower(btrim(p.email)) AS email, p."fullName" AS full_name
+      FROM patient p
+      WHERE p."contactId" IS NOT NULL
+        AND p.email IS NOT NULL
+        AND btrim(p.email) != ''
+    `),
+  );
+  return new Map(rows.map((r) => [r.email, r.full_name]));
+}
+
 // ── Single-patient remaining allowance (patient detail drawer) ───────────────
 //
 // Sourced live rather than from the analytics-DB sync copies (db_treatment_plan_tracker,

@@ -600,6 +600,12 @@ resource "aws_apigatewayv2_route" "patient_orders_detail" {
   target    = "integrations/${aws_apigatewayv2_integration.health.id}"
 }
 
+resource "aws_apigatewayv2_route" "health_2" {
+  api_id    = aws_apigatewayv2_api.analytics.id
+  route_key = "GET /health-2"
+  target    = "integrations/${aws_apigatewayv2_integration.health.id}"
+}
+
 # ── Custom Domain (optional) ───────────────────────────────────────────────────
 
 resource "aws_acm_certificate" "api" {

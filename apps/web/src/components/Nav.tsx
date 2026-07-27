@@ -8,6 +8,7 @@ const ALL_PAGES = [
     { path: "/", label: "Reconciliation" },
     { path: "/funnel-analytics", label: "Funnel Analytics" },
     { path: "/health", label: "Health Index" },
+    { path: "/health-2", label: "Health Index v2" },
     { path: "/zoho-health", label: "Zoho Health" },
     { path: "/shop-analytics", label: "Shop Analytics" },
     { path: "/patients", label: "Patients" },

@@ -37,7 +37,7 @@ allowed_origins = "https://analytics.simdoar.net"
 enable_frontend = true
 
 # ── Zoho integration ───────────────────────────────────────────────────────────
-zoho_client_id = "" # non-sensitive, fill in or move to GitHub Variables
+zoho_client_id = "1000.OUEWDY1AIJJNH4FGCLIYXO60NZ5IRT" # non-sensitive, fill in or move to GitHub Variables
 
 # ── Worker schedules ───────────────────────────────────────────────────────────
 saleor_schedule = "rate(1 hour)"

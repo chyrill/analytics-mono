@@ -13,6 +13,11 @@ import {
 // infra, consistent with how /health-data, /health-data/export, and
 // /health-detail already share this one Lambda.
 import { handler as patientOrdersDetailHandler } from "./patient-detail";
+// GET /health-2 — a deliberately separate module (own SQL, own classification
+// logic, no shared code with the rest of this file), just delegated to from
+// this Lambda's dispatch to avoid standing up a whole new function/IAM
+// role/log group for one route. See handlers/health2.ts for the design notes.
+import { handler as health2Handler } from "./health2";
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -657,6 +662,13 @@ export const handler: APIGatewayProxyHandlerV2 = async (event): Promise<APIGatew
     // (bundled into this same Lambda; see import comment above).
     if (routeKey === "GET /patient-orders-detail") {
       return patientOrdersDetailHandler(event, {} as never, (() => { }) as never) as Promise<APIGatewayProxyStructuredResultV2>;
+    }
+
+    // GET /health-2 — delegated to health2.ts's handler (bundled into this
+    // same Lambda; see import comment above). Independent query/logic from
+    // the /health-data path below.
+    if (routeKey === "GET /health-2") {
+      return health2Handler(event, {} as never, (() => { }) as never) as Promise<APIGatewayProxyStructuredResultV2>;
     }
 
     // GET /health-data

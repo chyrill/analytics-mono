@@ -115,6 +115,7 @@ app.get("/health-data", invokeHealth);
 app.get("/health-data/export", invokeHealth);
 app.get("/health-detail", invokeHealth);
 app.get("/patient-orders-detail", (req, res) => invoke(patientDetailHandler, req, res));
+app.get("/health-2", invokeHealth);
 
 // ── Sync helpers ──────────────────────────────────────────────────────────────
 

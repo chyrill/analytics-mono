@@ -19,6 +19,7 @@ async function seed() {
             { path: "/zoho-health", label: "Zoho Health", sortOrder: 4 },
             { path: "/shop-analytics", label: "Shop Analytics", sortOrder: 5 },
             { path: "/patients", label: "Patient Registry", sortOrder: 6 },
+            { path: "/health-2", label: "Customer Health Index v2", sortOrder: 7 },
         ])
         .onConflictDoNothing();
     console.log("Pages seeded.");
