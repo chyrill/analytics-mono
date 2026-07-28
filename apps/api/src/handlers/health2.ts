@@ -47,6 +47,10 @@ function daysSince(dateLike: string | Date | null | undefined): number | null {
   return (Date.now() - t) / MS_PER_DAY;
 }
 
+function addDays(date: Date, days: number): Date {
+  return new Date(date.getTime() + days * MS_PER_DAY);
+}
+
 // Reason codes documented in the design spec that we cannot honestly compute
 // from data currently synced into analytics-mono. Kept here (rather than
 // silently omitted) so the gap is visible to anyone reading this file.
@@ -327,6 +331,15 @@ export interface Health2Row {
   days_overdue: number | null;
   reason_codes: string[];
   sample_confidence: "thin" | "adequate";
+  // How long the patient has been sitting in their CURRENT health_color,
+  // and (only when a genuine, identifiable transition caused it) what
+  // colour they were in immediately before. Approximated from the same
+  // underlying dates used for classification (approved_at, first_order_at,
+  // last_order_at, streak_start_at, plan_expiration_date) — there's no
+  // persisted daily history of past colours, so this is reconstructed from
+  // "when would this rule have started applying", not an exact log.
+  days_in_bucket: number | null;
+  previous_health_color: HealthColor | null;
 }
 
 function utilisationTier(adherencePct: number | null): UtilisationTier {
@@ -341,7 +354,6 @@ function classifyRow(row: CadenceRow, name: string | null): Health2Row {
   const fulfilledOrderCount = row.fulfilled_order_count ?? 0;
   const completedCycles = row.completed_cycles ?? 0;
   const hasOrders = fulfilledOrderCount > 0;
-  const daysSinceApproved = daysSince(row.approved_at);
   const daysSinceLastOrder = daysSince(row.last_order_at);
   const adherencePct = row.adherence_pct != null ? Number(row.adherence_pct) : null;
   const repeatsRemaining = row.repeats_remaining != null ? Number(row.repeats_remaining) : null;
@@ -364,71 +376,51 @@ function classifyRow(row: CadenceRow, name: string | null): Health2Row {
   let watchFlag = false;
   let expectedNextOrderAt: string | null = null;
   let daysOverdue: number | null = null;
+  // When the CURRENT health_color started, and what colour preceded it (only
+  // set when there's a specific, identifiable transition — left null for a
+  // long-running, unchanged bucket so the frontend just shows a plain day
+  // count instead of a stale/meaningless "from" annotation).
+  let bucketStartAt: Date | null = null;
+  let previousColor: HealthColor | null = null;
 
   // "Do not allow the expected cadence to be less than 28 days" — floor from
   // the source spec; also the default when there isn't enough order history
   // yet to trust a personal median.
   const personalGapDays = Math.max(row.median_gap_days ?? 28, 28);
+  const lastOrderDate = row.last_order_at ? new Date(row.last_order_at) : null;
   if (row.last_order_at) {
     expectedNextOrderAt = new Date(new Date(row.last_order_at).getTime() + personalGapDays * MS_PER_DAY).toISOString();
     daysOverdue = daysSinceLastOrder != null ? Math.round(daysSinceLastOrder - personalGapDays) : null;
   }
 
   if (!hasOrders) {
-    // Approved but no first order.
+    // Approved but no first order yet — newly acquired, hasn't converted to
+    // a paying/ordering patient at all. Always Red regardless of how long
+    // they've been waiting; there's no "early days, still fine" grace period
+    // for a patient who hasn't purchased anything.
     lifecycleStage = "approved_not_ordered";
-    const d = daysSinceApproved ?? 0;
-    if (d <= 7) {
-      lifecycleLabel = "New — Awaiting activation";
-      healthColor = "green";
-    } else if (d <= 14) {
-      lifecycleLabel = "New — Watch";
-      healthColor = "green";
-      watchFlag = true;
-    } else if (d <= 28) {
-      lifecycleLabel = "Orange — Activation risk";
-      healthColor = "orange";
-    } else {
-      lifecycleLabel = "Red — Never activated";
-      healthColor = "red";
-    }
+    lifecycleLabel = "Red — Newly acquired, no order yet";
+    healthColor = "red";
+    bucketStartAt = row.approved_at ? new Date(row.approved_at) : null;
   } else if (completedCycles < 1) {
     // First order completed, second repeat not yet eligible — spec says
     // treat as normal/healthy, do not judge on utilisation of an incomplete cycle.
     lifecycleStage = "first_order_completed";
-    lifecycleLabel = "Provisional Green — first repeat cycle in progress";
+    lifecycleLabel = "Green — building tenure";
     healthColor = "green";
+    bucketStartAt = row.first_order_at ? new Date(row.first_order_at) : null;
+    previousColor = "red"; // always came from approved_not_ordered before their first order
   } else if (completedCycles === 1 || completedCycles === 2) {
-    // Awaiting/just-completed second repeat — this is "one of the most
-    // important early churn points" per the spec: judge on days-since-eligible,
-    // not on raw days-since-order.
+    // Awaiting/just-completed second repeat. Once a patient has purchased at
+    // all, they're building tenure and stay Green here — lateness on the
+    // second repeat is no longer judged with its own orange/red escalation
+    // (that risk is instead picked up later by the "established" cadence
+    // logic once they have enough order history for a personal median).
     lifecycleStage = completedCycles === 1 ? "awaiting_second_repeat" : "second_repeat_completed";
-    const d = daysOverdue ?? -Infinity;
-    if (d <= 0) {
-      lifecycleLabel =
-        completedCycles === 1 ? "Provisional Green — second repeat not yet eligible" : "Provisional Green — building tenure";
-      healthColor = "green";
-    } else if (d <= 7) {
-      lifecycleLabel = "Provisional Green — Watch";
-      healthColor = "green";
-      watchFlag = true;
-    } else if (d <= 14) {
-      lifecycleLabel = "Orange — Early repeat risk";
-      healthColor = "orange";
-      reasonCodes.push("SECOND_REPEAT_NOT_COMPLETED");
-    } else if (d <= 28) {
-      lifecycleLabel = "Orange — High activation risk";
-      healthColor = "orange";
-      reasonCodes.push("SECOND_REPEAT_NOT_COMPLETED");
-    } else if (d <= 56) {
-      lifecycleLabel = "Red — Failed to progress";
-      healthColor = "red";
-      reasonCodes.push("SECOND_REPEAT_NOT_COMPLETED");
-    } else {
-      lifecycleLabel = "Red — Churn review";
-      healthColor = "red";
-      reasonCodes.push("SECOND_REPEAT_NOT_COMPLETED");
-    }
+    lifecycleLabel = "Green — building tenure";
+    healthColor = "green";
+    bucketStartAt = row.first_order_at ? new Date(row.first_order_at) : null;
+    previousColor = "red";
   } else {
     // Established: three or more completed repeat cycles — full CHI applies.
     lifecycleStage = "established";
@@ -449,22 +441,41 @@ function classifyRow(row: CadenceRow, name: string | null): Health2Row {
       healthColor = "red";
       lifecycleLabel = "Red — two expected repeats missed, churn review";
       reasonCodes.push("TWO_CYCLES_MISSED");
+      bucketStartAt = lastOrderDate ? addDays(lastOrderDate, personalGapDays + 28) : null;
+      previousColor = "orange";
     } else if (d > 28) {
       healthColor = "red";
       lifecycleLabel = "Red — more than 28 days overdue";
       reasonCodes.push("OVERDUE_15_TO_28_DAYS");
+      bucketStartAt = lastOrderDate ? addDays(lastOrderDate, personalGapDays + 28) : null;
+      previousColor = "orange";
     } else if (d > 14) {
       healthColor = "orange";
       lifecycleLabel = "Orange — high risk";
       reasonCodes.push("OVERDUE_15_TO_28_DAYS");
+      bucketStartAt = lastOrderDate ? addDays(lastOrderDate, personalGapDays + 7) : null;
+      previousColor = "green";
     } else if (d > 7) {
       healthColor = "orange";
       lifecycleLabel = "Orange — emerging risk";
       reasonCodes.push("OVERDUE_8_TO_14_DAYS");
+      bucketStartAt = lastOrderDate ? addDays(lastOrderDate, personalGapDays + 7) : null;
+      previousColor = "green";
     } else if (d > 0) {
       healthColor = "green";
       lifecycleLabel = "Green — Watch";
       watchFlag = true;
+      // Still "green" as a colour either way — only a genuine transition if
+      // they were Purple immediately before crossing into overdue (Watch is
+      // unconditionally green regardless of adherence, so Purple always
+      // drops straight to green the moment d>0).
+      if (adherencePct != null && adherencePct >= 75) {
+        bucketStartAt = lastOrderDate ? addDays(lastOrderDate, personalGapDays) : null;
+        previousColor = "purple";
+      } else {
+        bucketStartAt = row.streak_start_at ? new Date(row.streak_start_at) : lastOrderDate;
+        previousColor = null;
+      }
     } else {
       // Not overdue: Purple requires sustained adherence, not just cadence.
       // But first check whether the CURRENT streak itself began with a huge
@@ -477,13 +488,31 @@ function classifyRow(row: CadenceRow, name: string | null): Health2Row {
       // isn't itself overdue yet.
       const reactivationGapDays = row.streak_longest_gap_days != null ? Number(row.streak_longest_gap_days) : null;
       const recentReactivation = reactivationGapDays != null && reactivationGapDays > 56 && (row.streak_order_count ?? 0) <= 2;
+      const streakStartDate = row.streak_start_at ? new Date(row.streak_start_at) : null;
       if (recentReactivation) {
         healthColor = "orange";
         lifecycleLabel = "Orange — reactivated after prolonged lapse, recovery not yet confirmed";
         reasonCodes.push("RECENT_REACTIVATION");
+        bucketStartAt = streakStartDate ?? lastOrderDate;
+        previousColor = "red";
       } else {
         healthColor = adherencePct != null && adherencePct >= 75 ? "purple" : "green";
         lifecycleLabel = healthColor === "purple" ? "Purple — sustained high engagement" : "Green — stable";
+        // Proxy for "how long has this healthy streak lasted" — the current
+        // streak (run of orders with no >28-day gap between them) is a
+        // reasonable stand-in since an overdue gap that size would itself
+        // have broken the streak. Only annotate a "previous colour" when
+        // this is plausibly a FRESH reactivation (first order or two of a
+        // new streak whose entry gap exceeded the overdue thresholds) —
+        // otherwise this is just an ongoing stable run, so leave it null and
+        // let the frontend show a plain day count.
+        bucketStartAt = streakStartDate ?? lastOrderDate;
+        const streakOrderCount = row.streak_order_count ?? 0;
+        if (streakOrderCount <= 1 && reactivationGapDays != null && reactivationGapDays > 28) {
+          previousColor = reactivationGapDays > 56 ? "red" : "orange";
+        } else {
+          previousColor = null;
+        }
       }
     }
 
@@ -511,16 +540,20 @@ function classifyRow(row: CadenceRow, name: string | null): Health2Row {
       // (found on Stuart Nita, 2026-07-24: health_color=orange, label="Green
       // — stable").
       if (healthColor === "purple" || healthColor === "green") {
+        previousColor = healthColor;
         healthColor = "orange";
         lifecycleLabel = "Orange — utilisation declining vs personal baseline";
+        bucketStartAt = lastOrderDate;
       }
     }
 
     if (repeatsRemaining != null && repeatsRemaining <= 0 && !planCurrentlyValid) {
       reasonCodes.push("REPEATS_EXHAUSTED");
       if (healthColor === "purple" || healthColor === "green") {
+        previousColor = healthColor;
         healthColor = "orange";
         lifecycleLabel = "Orange — repeats exhausted, plan renewal needed";
+        bucketStartAt = lastOrderDate;
       }
     }
 
@@ -555,13 +588,21 @@ function classifyRow(row: CadenceRow, name: string | null): Health2Row {
       // still plausibly reactivatable.
       lifecycleStage = daysSinceExpiry! > 90 ? "churned" : "lapsed";
       lifecycleLabel = lifecycleStage === "churned" ? "Red — treatment plan expired, churned" : "Red — treatment plan expired";
+      if (healthColor !== "red") previousColor = healthColor;
       healthColor = "red";
+      bucketStartAt = planExpiryDate;
     }
   }
 
   // Minimum-sample confidence gate — n<4 orders (or <1 completed cycle) means
   // a "personal median" isn't statistically trustworthy yet.
   const sampleConfidence: "thin" | "adequate" = fulfilledOrderCount >= 4 && completedCycles >= 1 ? "adequate" : "thin";
+
+  const daysInBucket = bucketStartAt != null ? Math.max(0, Math.round(daysSince(bucketStartAt) ?? 0)) : null;
+  // Never surface a "previous colour" that's the same as the current one —
+  // can happen if an overlay above reset bucketStartAt without an actual
+  // colour change (defensive; shouldn't occur given the checks above).
+  const finalPreviousColor = previousColor != null && previousColor !== healthColor ? previousColor : null;
 
   return {
     email: row.email,
@@ -580,8 +621,11 @@ function classifyRow(row: CadenceRow, name: string | null): Health2Row {
     days_overdue: daysOverdue != null ? Math.round(daysOverdue) : null,
     reason_codes: reasonCodes,
     sample_confidence: sampleConfidence,
+    days_in_bucket: daysInBucket,
+    previous_health_color: finalPreviousColor,
   };
 }
+
 
 async function loadHealth2Rows(): Promise<Health2Row[]> {
   const [cadenceResult, nameResult, population] = await Promise.all([

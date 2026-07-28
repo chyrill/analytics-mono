@@ -34,6 +34,8 @@ interface Health2Row {
     days_overdue: number | null;
     reason_codes: string[];
     sample_confidence: "thin" | "adequate";
+    days_in_bucket: number | null;
+    previous_health_color: HealthColor | null;
 }
 
 interface Health2Response {
@@ -64,6 +66,19 @@ const COLOR_HEX: Record<HealthColor, string> = {
     red: "#ef4444",
 };
 
+// "5 days from red" when the bucket only just changed (recent enough that
+// the prior colour is still worth calling out), otherwise a plain
+// "30 days" once it's been the same colour for a while.
+const RECENT_TRANSITION_THRESHOLD_DAYS = 14;
+function formatDaysInBucket(r: Health2Row): string | null {
+    if (r.days_in_bucket == null) return null;
+    const days = `${r.days_in_bucket} day${r.days_in_bucket === 1 ? "" : "s"}`;
+    if (r.previous_health_color != null && r.days_in_bucket <= RECENT_TRANSITION_THRESHOLD_DAYS) {
+        return `${days} from ${r.previous_health_color}`;
+    }
+    return days;
+}
+
 // Utilisation shown as a magnitude scale, not a second traffic light — a
 // low-utilisation patient isn't "bad", so it gets a filled-dot scale instead
 // of a color that implies judgment.
@@ -82,7 +97,6 @@ const REASON_LABELS: Record<string, string> = {
     DECLINING_PURCHASE_QUANTITY: "Qty down 50%+",
     LOW_UTILISATION_VS_BASELINE: "Low util. vs baseline",
     RECENT_REACTIVATION: "Recently reactivated",
-    SECOND_REPEAT_NOT_COMPLETED: "Stalled repeat",
     REPEATS_EXHAUSTED: "Repeats exhausted",
     TREATMENT_PLAN_EXPIRED: "Plan expired",
     UNKNOWN_REASON: "Unknown",
@@ -121,8 +135,28 @@ export default function Health2Page() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [search, setSearch] = useState("");
-    const [colorFilter, setColorFilter] = useState<HealthColor | "all">("all");
+    const [colorFilters, setColorFilters] = useState<Set<HealthColor>>(new Set());
     const [stageFilter, setStageFilter] = useState<LifecycleStage | "all">("all");
+
+    const [reasonFilters, setReasonFilters] = useState<Set<string>>(new Set());
+
+    function toggleColorFilter(c: HealthColor) {
+        setColorFilters((prev) => {
+            const next = new Set(prev);
+            if (next.has(c)) next.delete(c);
+            else next.add(c);
+            return next;
+        });
+    }
+
+    function toggleReasonFilter(code: string) {
+        setReasonFilters((prev) => {
+            const next = new Set(prev);
+            if (next.has(code)) next.delete(code);
+            else next.add(code);
+            return next;
+        });
+    }
     const [notAvailable, setNotAvailable] = useState<string[]>([]);
     const [sortKey, setSortKey] = useState<SortKey>("days_overdue");
     const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
@@ -170,10 +204,17 @@ export default function Health2Page() {
         return c;
     }, [rows]);
 
+    const reasonCounts = useMemo(() => {
+        const c: Record<string, number> = {};
+        for (const r of rows) for (const code of r.reason_codes) c[code] = (c[code] ?? 0) + 1;
+        return c;
+    }, [rows]);
+
     const filtered = useMemo(() => {
         const q = search.trim().toLowerCase();
         const list = rows.filter((r) => {
-            if (colorFilter !== "all" && r.health_color !== colorFilter) return false;
+            if (colorFilters.size > 0 && !colorFilters.has(r.health_color)) return false;
+            if (reasonFilters.size > 0 && !r.reason_codes.some((code) => reasonFilters.has(code))) return false;
             if (stageFilter !== "all" && r.lifecycle_stage !== stageFilter) return false;
             if (q && !(r.email.toLowerCase().includes(q) || (r.patient_name ?? "").toLowerCase().includes(q))) return false;
             return true;
@@ -183,7 +224,7 @@ export default function Health2Page() {
             const result = sortKey === "health_color" ? COLOR_RANK[a.health_color] - COLOR_RANK[b.health_color] : cmp(a[sortKey], b[sortKey]);
             return sortDir === "asc" ? result : -result;
         });
-    }, [rows, search, colorFilter, stageFilter, sortKey, sortDir]);
+    }, [rows, search, colorFilters, reasonFilters, stageFilter, sortKey, sortDir]);
 
     function toggleSort(key: SortKey) {
         if (sortKey === key) {
@@ -192,6 +233,52 @@ export default function Health2Page() {
             setSortKey(key);
             setSortDir(key === "adherence_pct" || key === "fulfilled_order_count" || key === "completed_cycles" ? "desc" : "asc");
         }
+    }
+
+    function downloadCsv() {
+        const columns: { key: keyof Health2Row; label: string }[] = [
+            { key: "patient_name", label: "Patient" },
+            { key: "email", label: "Email" },
+            { key: "health_color", label: "Health" },
+            { key: "days_in_bucket", label: "Days In Bucket" },
+            { key: "previous_health_color", label: "Previous Health" },
+            { key: "lifecycle_label", label: "Lifecycle Stage" },
+            { key: "utilisation_tier", label: "Utilisation" },
+            { key: "adherence_pct", label: "Adherence %" },
+            { key: "completed_cycles", label: "Cycles" },
+            { key: "fulfilled_order_count", label: "Orders" },
+            { key: "median_gap_days", label: "Median Gap (d)" },
+            { key: "last_order_at", label: "Last Order" },
+            { key: "expected_next_order_at", label: "Expected Next Order" },
+            { key: "days_overdue", label: "Days Overdue" },
+            { key: "sample_confidence", label: "Sample Confidence" },
+            { key: "watch_flag", label: "Watch" },
+        ];
+
+        function escapeCsv(value: unknown): string {
+            if (value == null) return "";
+            const s = String(value);
+            return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        }
+
+        const header = [...columns.map((c) => c.label), "Reason Codes"].join(",");
+        const lines = filtered.map((r) => {
+            const cells = columns.map((c) => escapeCsv(r[c.key]));
+            cells.push(escapeCsv(r.reason_codes.join("; ")));
+            return cells.join(",");
+        });
+        const csv = [header, ...lines].join("\n");
+
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        const stamp = new Date().toISOString().slice(0, 10);
+        a.href = url;
+        a.download = `health-2-${stamp}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
     }
 
     function thStyle(key: SortKey): CSSProperties {
@@ -227,16 +314,16 @@ export default function Health2Page() {
 
             <MethodologyDoc />
 
-            {/* Summary chips */}
-            <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+            {/* Summary chips — click to toggle, multiple can be active at once */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
                 {(["red", "orange", "green", "purple"] as HealthColor[]).map((c) => (
                     <button
                         key={c}
-                        onClick={() => setColorFilter(colorFilter === c ? "all" : c)}
+                        onClick={() => toggleColorFilter(c)}
                         style={{
                             border: `1px solid ${COLOR_HEX[c]}`,
-                            background: colorFilter === c ? COLOR_HEX[c] : "transparent",
-                            color: colorFilter === c ? "#111" : COLOR_HEX[c],
+                            background: colorFilters.has(c) ? COLOR_HEX[c] : "transparent",
+                            color: colorFilters.has(c) ? "#111" : COLOR_HEX[c],
                             borderRadius: 999,
                             padding: "4px 12px",
                             fontSize: 12,
@@ -248,6 +335,61 @@ export default function Health2Page() {
                         {c} · {counts[c]}
                     </button>
                 ))}
+                {colorFilters.size > 0 && (
+                    <button
+                        onClick={() => setColorFilters(new Set())}
+                        style={{
+                            border: "1px solid #444",
+                            background: "transparent",
+                            color: "#888",
+                            borderRadius: 999,
+                            padding: "4px 12px",
+                            fontSize: 12,
+                            cursor: "pointer",
+                        }}
+                    >
+                        Clear
+                    </button>
+                )}
+            </div>
+
+            {/* Reason/flag chips — multi-select, ANDed with the colour chips above */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+                {FLAG_DOCS.filter((f) => reasonCounts[f.code]).map((f) => (
+                    <button
+                        key={f.code}
+                        onClick={() => toggleReasonFilter(f.code)}
+                        title={f.body}
+                        style={{
+                            border: "1px solid #555",
+                            background: reasonFilters.has(f.code) ? "#e0a0a0" : "transparent",
+                            color: reasonFilters.has(f.code) ? "#111" : "#e0a0a0",
+                            borderRadius: 999,
+                            padding: "4px 12px",
+                            fontSize: 12,
+                            fontWeight: 600,
+                            cursor: "pointer",
+                        }}
+                    >
+                        {REASON_LABELS[f.code] ?? f.code} · {reasonCounts[f.code]}
+                    </button>
+                ))}
+                {reasonFilters.size > 0 && (
+                    <button
+                        onClick={() => setReasonFilters(new Set())}
+                        style={{
+                            border: "1px solid #444",
+                            background: "transparent",
+                            color: "#888",
+                            borderRadius: 999,
+                            padding: "4px 12px",
+                            fontSize: 12,
+                            cursor: "pointer",
+                        }}
+                    >
+                        Clear
+                    </button>
+                )}
             </div>
 
             <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
@@ -280,6 +422,21 @@ export default function Health2Page() {
                     <option value="churned">Churned (plan expired 90d+)</option>
                 </select>
                 <span style={{ fontSize: 12, color: "#888", alignSelf: "center", marginLeft: "auto" }}>{filtered.length} shown</span>
+                <button
+                    onClick={downloadCsv}
+                    disabled={filtered.length === 0}
+                    style={{
+                        padding: "8px 14px",
+                        borderRadius: 6,
+                        border: "1px solid #333",
+                        background: "#1a1a1a",
+                        color: filtered.length === 0 ? "#555" : "#e8e8e8",
+                        fontSize: 13,
+                        cursor: filtered.length === 0 ? "not-allowed" : "pointer",
+                    }}
+                >
+                    Download CSV
+                </button>
             </div>
 
             {loading && <div style={{ color: "#999" }}>Loading…</div>}
@@ -357,6 +514,9 @@ export default function Health2Page() {
                                             {r.health_color}
                                         </span>
                                         {r.watch_flag && <span style={{ marginLeft: 4, fontSize: 10, color: "#aaa" }}>· watch</span>}
+                                        {formatDaysInBucket(r) && (
+                                            <div style={{ fontSize: 10, color: "#888", marginTop: 2 }}>{formatDaysInBucket(r)}</div>
+                                        )}
                                     </td>
                                     <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
                                         <span style={{ padding: "2px 8px", borderRadius: 999, background: "#262626", fontSize: 11 }}>{r.lifecycle_label}</span>
@@ -430,26 +590,22 @@ const STAGE_DOCS: { stage: LifecycleStage; title: string; body: string }[] = [
     {
         stage: "approved_not_ordered",
         title: "Approved, not ordered",
-        body:
-            "Patient has an approved treatment plan but hasn't placed a first order yet. Judged on days since approval: " +
-            "≤7d Green (New), 8–14d Green + watch, 15–28d Orange (activation risk), 28d+ Red (never activated).",
+        body: "Patient has an approved treatment plan but hasn't placed a first order yet. Always Red — a newly acquired patient who hasn't purchased anything gets no grace period.",
     },
     {
         stage: "first_order_completed",
         title: "First order completed",
-        body: "Placed their first order; fewer than 1 treatment-plan window has elapsed. Always Provisional Green — too early to judge cadence or utilisation.",
+        body: "Placed their first order; fewer than 1 treatment-plan window has elapsed. Always Green (\"building tenure\") — as soon as a patient has purchased at all, too early to judge cadence or utilisation.",
     },
     {
         stage: "awaiting_second_repeat",
         title: "Awaiting 2nd repeat",
-        body:
-            "1 plan window elapsed. One of the most important early churn points — judged on days overdue vs. when their 2nd repeat becomes eligible: " +
-            "not overdue → Green, 1–7d → Green watch, 8–28d → Orange, 29d+ → Red.",
+        body: "1 plan window elapsed. Always Green (\"building tenure\") — lateness on the 2nd repeat is no longer judged with its own orange/red escalation here; that risk is picked up later by the Established cadence logic once there's enough order history.",
     },
     {
         stage: "second_repeat_completed",
         title: "2nd repeat completed",
-        body: "2 plan windows elapsed. Same overdue-day thresholds as \"Awaiting 2nd repeat\" — still building tenure before the full CHI applies.",
+        body: "2 plan windows elapsed. Always Green (\"building tenure\") — same reasoning as \"Awaiting 2nd repeat\", still building tenure before the full CHI applies.",
     },
     {
         stage: "established",
@@ -490,7 +646,6 @@ const FLAG_DOCS: { code: string; body: string }[] = [
         code: "RECENT_REACTIVATION",
         body: "Patient just returned from a 56+ day lapse with 2 or fewer orders since — cadence isn't proven yet, so held at Orange instead of Green/Purple.",
     },
-    { code: "SECOND_REPEAT_NOT_COMPLETED", body: "Still on their 1st or 2nd plan window and running late getting to the next repeat." },
     {
         code: "REPEATS_EXHAUSTED",
         body: "supply_tracking_history shows 0 repeats remaining on their current window AND Zoho shows no currently-valid (unexpired) plan to cover it.",
